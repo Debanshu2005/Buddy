@@ -45,11 +45,11 @@ class Config:
     # Sleep/Wake settings
     enable_sleep_mode: bool = True
     sleep_message: str = "💤 Going to sleep... No one around."
-    wake_message: str = "👀 Someone's here!"
+    wake_message: str = " Someone's here!"
     
     # Voice-based sleep/wake settings
     max_listening_attempts: int = 4  # Increased from 3 to 4
-    wake_word: str = "hey buddy"
+    wake_word: str = "hey0-buddy"
     voice_sleep_message: str = "💤 Going to sleep... Say 'Hey Buddy' to wake me up."
     
     # Logging
@@ -58,7 +58,7 @@ class Config:
     log_format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     
     # LLM Service Configuration
-    llm_service_url: str = "http://192.168.31.150:8000"
+    llm_service_url: str = "http://192.168.0.169:8000"
     
     @classmethod
     def from_env(cls) -> 'Config':
