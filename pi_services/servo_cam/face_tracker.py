@@ -32,13 +32,13 @@ CASCADE  = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 MIN_FACE = (40, 40)
 
 # ── PID gains ──────────────────────────────────────────────────────────────── #
-Kp = 0.05   # increase for faster tracking
+Kp = 0.15   # increase for faster tracking
 Ki = 0.001  # corrects slow drift
-Kd = 0.01   # reduce oscillation/overshoot
+Kd = 0.02   # reduce oscillation/overshoot
 
 # ── Behaviour ──────────────────────────────────────────────────────────────── #
-DEADZONE = 15    # pixels — no movement when face is within this range of center
-MAX_STEP = 8.0   # degrees — max servo movement per tick
+DEADZONE = 20    # pixels — no movement when face is within this range of center
+MAX_STEP = 12.0  # degrees — max servo movement per tick
 LOOP_HZ  = 15
 
 
@@ -153,7 +153,7 @@ class FaceTracker:
         gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray  = cv2.equalizeHist(gray)
         faces = self._cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=4, minSize=MIN_FACE
+            gray, scaleFactor=1.1, minNeighbors=2, minSize=MIN_FACE
         )
         if len(faces) == 0:
             return None

@@ -11,7 +11,7 @@ Angle range: 50° (down) → 130° (up), center = 90°
 import RPi.GPIO as GPIO
 import time
 
-SERVO_PIN  = 17
+SERVO_PIN  = 2
 PWM_FREQ   = 50
 
 TILT_MIN    = 50
