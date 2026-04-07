@@ -28,8 +28,11 @@ FRAME_H      = 240
 FPS          = 15
 
 # ── Detection ──────────────────────────────────────────────────────────────── #
-CASCADE  = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-MIN_FACE = (40, 40)
+CASCADE        = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+MIN_FACE       = (30, 30)
+SCALE_FACTOR   = 1.05  # finer steps = more detections
+MIN_NEIGHBORS  = 2
+MISS_TOLERANCE = 5     # frames without detection before giving up
 
 # ── PID gains ──────────────────────────────────────────────────────────────── #
 Kp = 0.15   # increase for faster tracking
@@ -37,9 +40,11 @@ Ki = 0.001  # corrects slow drift
 Kd = 0.02   # reduce oscillation/overshoot
 
 # ── Behaviour ──────────────────────────────────────────────────────────────── #
-DEADZONE = 20    # pixels — no movement when face is within this range of center
-MAX_STEP = 12.0  # degrees — max servo movement per tick
-LOOP_HZ  = 15
+DEADZONE       = 25    # pixels — no movement when face is within this range of center
+MAX_STEP       = 15.0  # degrees — max servo movement per tick
+LOOP_HZ        = 15
+MOTION_BOOST   = 1.8   # extra multiplier when face is actively moving
+MOTION_THRESH  = 8     # pixels — min movement between frames to count as motion
 
 
 class PID:
@@ -71,7 +76,11 @@ class FaceTracker:
         self._running     = False
         self._thread      = None
         self._locked      = False
-        self._pid         = PID(Kp, Ki, Kd)
+        self._pid        = PID(Kp, Ki, Kd)
+        self._last_face  = None  # last known face position
+        self._miss_count = 0     # consecutive missed frames
+        self._prev_cy    = None  # previous face center y for motion direction
+        self._direction  = 0     # +1 = moving down, -1 = moving up, 0 = still
 
         self._cascade = cv2.CascadeClassifier(CASCADE)
         if self._cascade.empty():
@@ -113,30 +122,56 @@ class FaceTracker:
             if not ret:
                 time.sleep(0.1)
                 continue
-            face = self._detect_largest_face(frame)
+            detected = self._detect_largest_face(frame)
+
+            if detected is not None:
+                self._last_face  = detected
+                self._miss_count = 0
+            else:
+                self._miss_count += 1
+                if self._miss_count > MISS_TOLERANCE:
+                    self._last_face = None
+
+            face = self._last_face
 
             if face is not None:
                 fx, fy, fw, fh = face
                 face_cy = fy + fh // 2
-                err_y   = face_cy - FRAME_H // 2  # positive = face below center
+                err_y   = face_cy - FRAME_H // 2
 
-                if abs(err_y) < DEADZONE:
+                # detect motion direction
+                if self._prev_cy is not None:
+                    dy = face_cy - self._prev_cy
+                    if abs(dy) >= MOTION_THRESH:
+                        self._direction = 1 if dy > 0 else -1
+                    else:
+                        self._direction = 0
+                self._prev_cy = face_cy
+
+                if abs(err_y) < DEADZONE and self._direction == 0:
                     self._locked = True
                     self._pid.reset()
                     self.servo._idle()
                     print(f"🔒 LOCKED  tilt={self.servo.angle:.1f}°")
                 else:
                     self._locked = False
-                    step = self._clamp(self._pid.compute(err_y), -MAX_STEP, MAX_STEP)
-                    # face below center (err_y > 0) → tilt down (decrease angle)
+                    boost = MOTION_BOOST if self._direction != 0 else 1.0
+                    step  = self._clamp(self._pid.compute(err_y) * boost, -MAX_STEP, MAX_STEP)
+                    # also nudge immediately in motion direction even if err_y is small
+                    if self._direction != 0 and abs(err_y) < DEADZONE:
+                        step = -self._direction * 3.0
                     self.servo.step(-step)
-                    print(f"🎯 tracking  err_y={err_y:+.0f}px  step={-step:+.1f}°  tilt={self.servo.angle:.1f}°")
+                    dir_str = "⬆️" if self._direction == -1 else "⬇️" if self._direction == 1 else "➡️"
+                    print(f"🎯 {dir_str}  err_y={err_y:+.0f}px  step={-step:+.1f}°  tilt={self.servo.angle:.1f}°")
 
                 if self.show_preview:
-                    cv2.rectangle(frame, (fx, fy), (fx+fw, fy+fh), (0, 255, 0), 2)
-                    cv2.circle(frame, (fx + fw//2, face_cy), 4, (0, 255, 0), -1)
+                    color = (0, 255, 0) if detected is not None else (0, 165, 255)
+                    cv2.rectangle(frame, (fx, fy), (fx+fw, fy+fh), color, 2)
+                    cv2.circle(frame, (fx + fw//2, face_cy), 4, color, -1)
             else:
                 self._locked = False
+                self._prev_cy = None
+                self._direction = 0
                 self._pid.reset()
                 print("👀 no face detected")
 
@@ -153,7 +188,7 @@ class FaceTracker:
         gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray  = cv2.equalizeHist(gray)
         faces = self._cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=2, minSize=MIN_FACE
+            gray, scaleFactor=SCALE_FACTOR, minNeighbors=MIN_NEIGHBORS, minSize=MIN_FACE
         )
         if len(faces) == 0:
             return None
