@@ -1,18 +1,7 @@
 """
 FaceTracker — tilt-only face tracking (up/down).
-
-Tracks the vertical position of the largest detected face and moves
-the tilt servo to keep it centered in frame using a PID controller.
-
-  - Large vertical offset → fast servo movement
-  - Small offset          → slow, precise correction
-  - Within deadzone       → servo stops (locked on)
-
-Usage:
-    tracker = FaceTracker()
-    tracker.start()
-    ...
-    tracker.stop()
+Uses EMA smoothing on face position to handle blurry/noisy USB cameras.
+Simple proportional control instead of PID to avoid oscillation/vibration.
 """
 
 import cv2
@@ -22,51 +11,33 @@ import threading
 from .servo_cam_controller import TiltController
 
 # ── Camera ─────────────────────────────────────────────────────────────────── #
-CAMERA_INDEX = 0     # change if your USB camera isn't /dev/video0
+CAMERA_INDEX = 0
 FRAME_W      = 320
 FRAME_H      = 240
 FPS          = 15
 
 # ── Detection ──────────────────────────────────────────────────────────────── #
-CASCADE        = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+CASCADES = [
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml",
+    cv2.data.haarcascades + "haarcascade_frontalface_alt.xml",
+    cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml",
+    cv2.data.haarcascades + "haarcascade_profileface.xml",
+]
 MIN_FACE       = (30, 30)
-SCALE_FACTOR   = 1.05  # finer steps = more detections
+SCALE_FACTOR   = 1.05
 MIN_NEIGHBORS  = 2
-MISS_TOLERANCE = 5     # frames without detection before giving up
+MISS_TOLERANCE = 6  # frames before losing track
 
-# ── PID gains ──────────────────────────────────────────────────────────────── #
-Kp = 0.15   # increase for faster tracking
-Ki = 0.001  # corrects slow drift
-Kd = 0.02   # reduce oscillation/overshoot
+# ── Smoothing ──────────────────────────────────────────────────────────────── #
+# EMA alpha: lower = smoother but slower, higher = faster but noisier
+# 0.2 works well for blurry cameras
+EMA_ALPHA = 0.35  # higher = faster response, lower = smoother
 
-# ── Behaviour ──────────────────────────────────────────────────────────────── #
-DEADZONE       = 25    # pixels — no movement when face is within this range of center
-MAX_STEP       = 15.0  # degrees — max servo movement per tick
-LOOP_HZ        = 15
-MOTION_BOOST   = 1.8   # extra multiplier when face is actively moving
-MOTION_THRESH  = 8     # pixels — min movement between frames to count as motion
-
-
-class PID:
-    def __init__(self, kp, ki, kd):
-        self.kp, self.ki, self.kd = kp, ki, kd
-        self._integral  = 0.0
-        self._prev_err  = 0.0
-        self._prev_time = time.time()
-
-    def compute(self, error: float) -> float:
-        now = time.time()
-        dt  = max(now - self._prev_time, 1e-4)
-        self._integral += error * dt
-        derivative      = (error - self._prev_err) / dt
-        output          = self.kp * error + self.ki * self._integral + self.kd * derivative
-        self._prev_err  = error
-        self._prev_time = now
-        return output
-
-    def reset(self):
-        self._integral = 0.0
-        self._prev_err = 0.0
+# ── Control ────────────────────────────────────────────────────────────────── #
+Kp       = 0.06   # proportional gain — how much to move per pixel of error
+DEADZONE = 25     # pixels — stop moving when face is this close to center
+MAX_STEP = 10.0   # degrees — hard cap per tick to prevent jerky jumps
+LOOP_HZ  = 20     # higher loop rate = tighter sync with face movement
 
 
 class FaceTracker:
@@ -76,15 +47,20 @@ class FaceTracker:
         self._running     = False
         self._thread      = None
         self._locked      = False
-        self._pid        = PID(Kp, Ki, Kd)
-        self._last_face  = None  # last known face position
-        self._miss_count = 0     # consecutive missed frames
-        self._prev_cy    = None  # previous face center y for motion direction
-        self._direction  = 0     # +1 = moving down, -1 = moving up, 0 = still
 
-        self._cascade = cv2.CascadeClassifier(CASCADE)
-        if self._cascade.empty():
-            raise RuntimeError(f"Could not load cascade: {CASCADE}")
+        self._last_face   = None
+        self._miss_count  = 0
+        self._smooth_cy   = None  # EMA smoothed face center Y
+        self._locked_face = None  # the face we are committed to tracking
+
+        self._cascades = []
+        for path in CASCADES:
+            c = cv2.CascadeClassifier(path)
+            if not c.empty():
+                self._cascades.append(c)
+        if not self._cascades:
+            raise RuntimeError("No cascade classifiers could be loaded")
+        print(f"✅ Loaded {len(self._cascades)} cascade(s)")
 
         self._cam = cv2.VideoCapture(CAMERA_INDEX)
         self._cam.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
@@ -95,7 +71,7 @@ class FaceTracker:
 
     def start(self):
         self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread  = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         print("🎯 FaceTracker started")
 
@@ -110,70 +86,91 @@ class FaceTracker:
         print("🛑 FaceTracker stopped")
 
     @property
-    def is_locked(self) -> bool:
+    def is_locked(self):
         return self._locked
 
     def _loop(self):
         interval = 1.0 / LOOP_HZ
 
         while self._running:
-            t0  = time.time()
+            t0 = time.time()
+
             ret, frame = self._cam.read()
             if not ret:
                 time.sleep(0.1)
                 continue
-            detected = self._detect_largest_face(frame)
 
-            if detected is not None:
-                self._last_face  = detected
-                self._miss_count = 0
+            all_faces = self._detect_all_faces(frame)
+
+            # ── face locking: stick to one face once acquired ──────────────── #
+            if self._locked_face is None:
+                # not tracking anyone yet — pick the largest face
+                if all_faces:
+                    self._locked_face = max(all_faces, key=lambda f: f[2] * f[3])
+                    self._miss_count  = 0
             else:
-                self._miss_count += 1
-                if self._miss_count > MISS_TOLERANCE:
-                    self._last_face = None
+                # already tracking — find the closest face to last known position
+                lx, ly, lw, lh = self._locked_face
+                lcx = lx + lw // 2
+                lcy = ly + lh // 2
+                best, best_dist = None, 80  # max pixels to still count as same face
+                for f in all_faces:
+                    fx, fy, fw, fh = f
+                    dist = ((fx + fw//2 - lcx)**2 + (fy + fh//2 - lcy)**2) ** 0.5
+                    if dist < best_dist:
+                        best, best_dist = f, dist
+                if best is not None:
+                    self._locked_face = best
+                    self._miss_count  = 0
+                else:
+                    self._miss_count += 1
+                    if self._miss_count > MISS_TOLERANCE:
+                        self._locked_face = None
+                        self._smooth_cy   = None
+
+            detected = self._locked_face is not None and self._miss_count == 0
+
+            # ── update tracking state ──────────────────────────────────────── #
+            if self._locked_face is not None:
+                self._last_face  = self._locked_face
+            else:
+                self._last_face  = None
+                self._smooth_cy  = None
 
             face = self._last_face
 
             if face is not None:
                 fx, fy, fw, fh = face
-                face_cy = fy + fh // 2
-                err_y   = face_cy - FRAME_H // 2
+                raw_cy = fy + fh // 2
 
-                # detect motion direction
-                if self._prev_cy is not None:
-                    dy = face_cy - self._prev_cy
-                    if abs(dy) >= MOTION_THRESH:
-                        self._direction = 1 if dy > 0 else -1
-                    else:
-                        self._direction = 0
-                self._prev_cy = face_cy
+                # EMA smoothing — filters out jitter from blurry detections
+                if self._smooth_cy is None:
+                    self._smooth_cy = float(raw_cy)
+                else:
+                    self._smooth_cy = EMA_ALPHA * raw_cy + (1 - EMA_ALPHA) * self._smooth_cy
 
-                if abs(err_y) < DEADZONE and self._direction == 0:
+                err_y = self._smooth_cy - FRAME_H // 2  # + = face below center
+
+                if abs(err_y) < DEADZONE:
+                    # locked on — cut PWM to stop vibration
                     self._locked = True
-                    self._pid.reset()
                     self.servo._idle()
                     print(f"🔒 LOCKED  tilt={self.servo.angle:.1f}°")
                 else:
                     self._locked = False
-                    boost = MOTION_BOOST if self._direction != 0 else 1.0
-                    step  = self._clamp(self._pid.compute(err_y) * boost, -MAX_STEP, MAX_STEP)
-                    # also nudge immediately in motion direction even if err_y is small
-                    if self._direction != 0 and abs(err_y) < DEADZONE:
-                        step = -self._direction * 3.0
+                    # simple proportional step, capped at MAX_STEP
+                    step = self._clamp(Kp * err_y, -MAX_STEP, MAX_STEP)
                     self.servo.step(-step)
-                    dir_str = "⬆️" if self._direction == -1 else "⬇️" if self._direction == 1 else "➡️"
-                    print(f"🎯 {dir_str}  err_y={err_y:+.0f}px  step={-step:+.1f}°  tilt={self.servo.angle:.1f}°")
+                    print(f"🎯 err_y={err_y:+.0f}px  step={-step:+.1f}°  tilt={self.servo.angle:.1f}°")
 
                 if self.show_preview:
                     color = (0, 255, 0) if detected is not None else (0, 165, 255)
                     cv2.rectangle(frame, (fx, fy), (fx+fw, fy+fh), color, 2)
-                    cv2.circle(frame, (fx + fw//2, face_cy), 4, color, -1)
+                    cy_int = int(self._smooth_cy)
+                    cv2.circle(frame, (fx + fw//2, cy_int), 5, (255, 0, 0), -1)
             else:
                 self._locked = False
-                self._prev_cy = None
-                self._direction = 0
-                self._pid.reset()
-                print("👀 no face detected")
+                print("👀 searching...")
 
             if self.show_preview:
                 cv2.drawMarker(frame, (FRAME_W//2, FRAME_H//2), (0, 0, 255), cv2.MARKER_CROSS, 20, 1)
@@ -184,15 +181,51 @@ class FaceTracker:
 
             time.sleep(max(0, interval - (time.time() - t0)))
 
-    def _detect_largest_face(self, frame):
+    def _detect_all_faces(self, frame):
         gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray  = cv2.equalizeHist(gray)
-        faces = self._cascade.detectMultiScale(
-            gray, scaleFactor=SCALE_FACTOR, minNeighbors=MIN_NEIGHBORS, minSize=MIN_FACE
+
+        all_faces = []
+        for cascade in self._cascades:
+            faces = cascade.detectMultiScale(
+                gray,
+                scaleFactor=SCALE_FACTOR,
+                minNeighbors=MIN_NEIGHBORS,
+                minSize=MIN_FACE
+            )
+            if len(faces) > 0:
+                all_faces.extend(faces)
+
+        # also try flipped frame for the other profile direction
+        flipped = cv2.flip(gray, 1)
+        profile = self._cascades[-1]  # profileface cascade
+        faces_flipped = profile.detectMultiScale(
+            flipped,
+            scaleFactor=SCALE_FACTOR,
+            minNeighbors=MIN_NEIGHBORS,
+            minSize=MIN_FACE
         )
-        if len(faces) == 0:
-            return None
-        return max(faces, key=lambda f: f[2] * f[3])
+        if len(faces_flipped) > 0:
+            # mirror x coordinates back
+            for (fx, fy, fw, fh) in faces_flipped:
+                all_faces.append((FRAME_W - fx - fw, fy, fw, fh))
+
+        return self._deduplicate(all_faces)
+
+    @staticmethod
+    def _deduplicate(faces, thresh=40):
+        """Remove overlapping detections from multiple cascades."""
+        result = []
+        for face in faces:
+            x, y, w, h = face
+            duplicate = False
+            for ex, ey, ew, eh in result:
+                if abs(x - ex) < thresh and abs(y - ey) < thresh:
+                    duplicate = True
+                    break
+            if not duplicate:
+                result.append(face)
+        return result
 
     @staticmethod
     def _clamp(val, lo, hi):
