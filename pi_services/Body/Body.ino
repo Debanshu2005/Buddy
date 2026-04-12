@@ -36,14 +36,20 @@ void setup() {
   Serial.begin(115200);
   Serial.setTimeout(50);
 
-  pinMode(R_EN1,   OUTPUT); pinMode(L_EN1,   OUTPUT);
-  pinMode(R_EN2,  OUTPUT); pinMode(L_EN2,  OUTPUT);
-  pinMode(R_PWM1,  OUTPUT); pinMode(L_PWM1,  OUTPUT);
-  pinMode(R_PWM2, OUTPUT); pinMode(L_PWM2, OUTPUT);
+  pinMode(R_EN1,   OUTPUT);
+  pinMode(L_EN1,   OUTPUT);
+  pinMode(R_EN2,  OUTPUT);
+  pinMode(L_EN2,  OUTPUT);
+  pinMode(R_PWM1,  OUTPUT);
+  pinMode(L_PWM1,  OUTPUT);
+  pinMode(R_PWM2, OUTPUT);
+  pinMode(L_PWM2, OUTPUT);
   pinMode(12, OUTPUT); // L2
 
-  digitalWrite(R_EN1,  HIGH); digitalWrite(L_EN1,  HIGH);
-  digitalWrite(R_EN2, HIGH); digitalWrite(L_EN2, HIGH);
+  digitalWrite(R_EN1,  HIGH);
+  digitalWrite(L_EN1,  HIGH);
+  digitalWrite(R_EN2, HIGH);
+  digitalWrite(L_EN2, HIGH);
   digitalWrite(12, HIGH); // Enable L298N motor driver
 
   pinMode(TRIG_PIN, OUTPUT);
@@ -55,8 +61,10 @@ void setup() {
 
 // ===== DISTANCE =====
 long getDistanceCM() {
-  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
   long d = pulseIn(ECHO_PIN, HIGH, 30000);
   if (d == 0) return 999;   // timeout = open space
@@ -64,26 +72,13 @@ long getDistanceCM() {
 }
 
 // ===== MOTOR PRIMITIVES =====
-void stopMotors()   { analogWrite(R_PWM1,0);   analogWrite(L_PWM1,0);
-                      analogWrite(R_PWM2,0);  analogWrite(L_PWM2,0);   }
-
-void moveForward()  { analogWrite(R_PWM1,255); analogWrite(L_PWM1,0);
-                      analogWrite(R_PWM2,255);analogWrite(L_PWM2,0);   }
-
-void moveBackward() { analogWrite(R_PWM1,0);   analogWrite(L_PWM1,200);
-                      analogWrite(R_PWM2,0);  analogWrite(L_PWM2,200); }
-
-void moveLeft()     { analogWrite(R_PWM1,255); analogWrite(L_PWM1,100);
-                      analogWrite(R_PWM2,255);analogWrite(L_PWM2,100); }
-
-void moveRight()    { analogWrite(R_PWM1,100); analogWrite(L_PWM1,255);
-                      analogWrite(R_PWM2,100);analogWrite(L_PWM2,255); }
-
-void spinLeft()     { analogWrite(R_PWM1,220); analogWrite(L_PWM1,0);
-                      analogWrite(R_PWM2,220);analogWrite(L_PWM2,0);   }
-
-void spinRight()    { analogWrite(R_PWM1,0);   analogWrite(L_PWM1,220);
-                      analogWrite(R_PWM2,0);  analogWrite(L_PWM2,220); }
+void stopMotors()   { analogWrite(R_PWM1,0);   analogWrite(L_PWM1,0); }
+void moveForward()  { analogWrite(R_PWM1,255); analogWrite(L_PWM1,0); analogWrite(R_PWM2,255);analogWrite(L_PWM2,0); }
+void moveBackward() { analogWrite(R_PWM1,0);   analogWrite(L_PWM1,200); analogWrite(R_PWM2,0);  analogWrite(L_PWM2,200); }
+void moveLeft()     { analogWrite(R_PWM1,255); analogWrite(L_PWM1,100); analogWrite(R_PWM2,255);analogWrite(L_PWM2,100); }
+void moveRight()    { analogWrite(R_PWM1,100); analogWrite(L_PWM1,255); analogWrite(R_PWM2,100);analogWrite(L_PWM2,255); }
+void spinLeft()     { analogWrite(R_PWM1,220); analogWrite(L_PWM1,0); analogWrite(R_PWM2,220);analogWrite(L_PWM2,0); }
+void spinRight()    { analogWrite(R_PWM1,0);   analogWrite(L_PWM1,220); analogWrite(R_PWM2,0);  analogWrite(L_PWM2,220); }
 
 // ===== APPLY COMMAND (only acts when command changes) =====
 void applyCommand(String cmd) {
