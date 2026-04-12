@@ -9,10 +9,9 @@
 #define R_PWM2 9
 
 // ===== ULTRASONIC =====
-#define TRIG_PIN        3
+#define TRIG        3
 #define ECHO_PIN        4
-#define SAFE_DISTANCE   25    // cm — reliable HC-SR04 range
-#define OBSTACLE_CONFIRMS 3   // consecutive readings to confirm
+#define SAFE_DISTANCE   25    // cm
 
 // ===== STATE =====
 String currentCommand  = "S";
@@ -52,7 +51,7 @@ void setup() {
   digitalWrite(L_EN2, HIGH);
   digitalWrite(12, HIGH); // Enable L298N motor driver
 
-  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(TRIG, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
   stopMotors();
@@ -61,11 +60,11 @@ void setup() {
 
 // ===== DISTANCE =====
 long getDistanceCM() {
-  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(TRIG, LOW);
   delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
+  digitalWrite(TRIG, HIGH);
   delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(TRIG, LOW);
   long d = pulseIn(ECHO_PIN, HIGH, 30000);
   if (d == 0) return 999;   // timeout = open space
   return d * 0.034 / 2;
@@ -73,18 +72,18 @@ long getDistanceCM() {
 
 // ===== MOTOR PRIMITIVES =====
 void stopMotors()   { analogWrite(R_PWM1,0);   analogWrite(L_PWM1,0); }
-void moveForward()  { analogWrite(R_PWM1,255); analogWrite(L_PWM1,0); analogWrite(R_PWM2,255);analogWrite(L_PWM2,0); }
-void moveBackward() { analogWrite(R_PWM1,0);   analogWrite(L_PWM1,200); analogWrite(R_PWM2,0);  analogWrite(L_PWM2,200); }
-void moveLeft()     { analogWrite(R_PWM1,255); analogWrite(L_PWM1,100); analogWrite(R_PWM2,255);analogWrite(L_PWM2,100); }
-void moveRight()    { analogWrite(R_PWM1,100); analogWrite(L_PWM1,255); analogWrite(R_PWM2,100);analogWrite(L_PWM2,255); }
-void spinLeft()     { analogWrite(R_PWM1,220); analogWrite(L_PWM1,0); analogWrite(R_PWM2,220);analogWrite(L_PWM2,0); }
-void spinRight()    { analogWrite(R_PWM1,0);   analogWrite(L_PWM1,220); analogWrite(R_PWM2,0);  analogWrite(L_PWM2,220); }
+void moveForward()  { analogWrite(R_PWM1,255); analogWrite(L_PWM1,0); }
+void moveBackward() { analogWrite(R_PWM1,0);   analogWrite(L_PWM1,200); }
+void moveLeft()     { analogWrite(R_PWM1,255); analogWrite(L_PWM1,100); }
+void moveRight()    { analogWrite(R_PWM1,100); analogWrite(L_PWM1,255); }
+void spinLeft()     { analogWrite(R_PWM1,220); analogWrite(L_PWM1,0); }
+void spinRight()    { analogWrite(R_PWM1,0);   analogWrite(L_PWM1,220); }
 
 // ===== APPLY COMMAND (only acts when command changes) =====
 void applyCommand(String cmd) {
   if (cmd == runningCommand) return;  // already doing this — skip
   runningCommand = cmd;
-  if      (cmd == "F") moveForward();
+  if (cmd == "F") moveForward();
   else if (cmd == "B") moveBackward();
   else if (cmd == "L") moveLeft();
   else if (cmd == "R") moveRight();
@@ -95,3 +94,32 @@ void applyCommand(String cmd) {
 
 // ===== WIGGLE (happy dance) =====
 void updateWiggle() {
+  if (wiggling) {
+    if (millis() - wiggleTimer >= WIGGLE_STEP_MS) {
+      wiggleStep++;
+      wiggleTimer = millis();
+    }
+  }
+}
+
+// ===== NOD (nodding dance) =====
+void updateNod() {
+  if (nodding) {
+    if (millis() - nodTimer >= NOD_STEP_MS) {
+      nodStep++;
+      nodTimer = millis();
+    }
+  }
+}
+
+// ===== LOOP =====
+void loop() {
+  // Your code here
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    applyCommand(command);
+  }
+  updateWiggle();
+  updateNod();
+  delay(10);
+}
