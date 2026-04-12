@@ -1,4 +1,0 @@
-2. CMD: git add .
-3. CMD: git commit -m "Initial commit"
-4. CMD: git remote add origin https://github.com/your-username/your-repo-name.git
-5. CMD: git push -u origin master
