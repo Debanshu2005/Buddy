@@ -149,20 +149,24 @@ class MotorController:
 
         def _do():
             if cmd == "PAN":
-                # Short left-right pan — self-stopping, doesn't affect main movement
+                # Short left-right pan — restore previous movement after
+                prev = self._current_cmd
                 self._send_raw("L"); time.sleep(0.35)
                 self._send_raw("R"); time.sleep(0.35)
-                self._send_raw("S")
-                print(f"🎭 Pan done for '{e}'")
+                # restore previous move, or stop if we were already stopped
+                if prev in ("F", "B", "L", "R"):
+                    self._send_raw(prev)
+                else:
+                    self._send_raw("S")
+                print(f"🎭 Pan done for '{e}', restored '{prev}'")
             elif cmd in ("W", "N"):
                 # Arduino handles full animation, sends WIGGLE_DONE/NOD_DONE when done
                 self._send_raw(cmd)
                 print(f"🎭 Animation '{cmd}' sent for '{e}'")
             else:
-                # Continuous directional move (sad=B, surprised=F etc.)
-                # Runs until obstacle or voice stop — same as any other move
-                self.move(cmd)
-                print(f"🎭 Continuous '{cmd}' for emotion '{e}'")
+                # Timed directional move — auto-stop after 1.5s
+                self.move(cmd, duration=1.5)
+                print(f"🎭 Timed '{cmd}' for emotion '{e}' (1.5s)")
 
         threading.Thread(target=_do, daemon=True).start()
 

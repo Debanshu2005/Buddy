@@ -102,33 +102,33 @@ class ServoController:
         self._pwm.ChangeDutyCycle(0)  # turn off PWM to prevent jitter/hum
     
     def _smooth_move(self):
-        """Gradually move from current to target angle."""
+        """Gradually move from current to target angle with ease-in-out."""
         if self._moving:
             return  # already moving
-        
+
         self._moving = True
-        
+
         try:
-            steps = 20
-            delay = 0.02  # 20ms between steps
-            
+            steps = 60
+            delay = 0.02  # 20ms between steps → ~1.2s total
+
             start = self._current_angle
             end   = self._target_angle
-            delta = (end - start) / steps
-            
-            for i in range(steps):
-                angle = start + (delta * i)
-                duty = _angle_to_duty(angle)
-                self._pwm.ChangeDutyCycle(duty)
+
+            for i in range(1, steps + 1):
+                t = i / steps
+                # ease-in-out: slow start, fast middle, slow end
+                t_eased = t * t * (3 - 2 * t)
+                angle = start + (end - start) * t_eased
+                self._pwm.ChangeDutyCycle(_angle_to_duty(angle))
                 self._current_angle = angle
                 time.sleep(delay)
-            
-            # Final position
+
             self._pwm.ChangeDutyCycle(_angle_to_duty(end))
             self._current_angle = end
             time.sleep(0.1)
             self._pwm.ChangeDutyCycle(0)  # turn off
-            
+
         finally:
             self._moving = False
     

@@ -47,12 +47,16 @@ class TiltController:
         self._apply(angle)
 
     def step(self, delta: float):
-        angle = self._angle + delta
-        angle = max(TILT_MIN, min(TILT_MAX, angle))
-        self._angle = angle
+        target = max(TILT_MIN, min(TILT_MAX, self._angle + delta))
         if self._pwm:
-            self._pwm.ChangeDutyCycle(_duty(angle))
-            time.sleep(0.03)   # just enough for servo to start moving
+            steps = 8
+            step_size = (target - self._angle) / steps
+            for _ in range(steps):
+                self._angle += step_size
+                self._pwm.ChangeDutyCycle(_duty(self._angle))
+                time.sleep(0.02)
+        self._angle = target
+        if self._pwm:
             self._pwm.ChangeDutyCycle(0)  # cut PWM immediately to stop vibration
 
     def center(self):
@@ -71,9 +75,17 @@ class TiltController:
         print("🔌 TiltController cleaned up")
 
     def _apply(self, angle: float):
-        if self._pwm:
-            self._pwm.ChangeDutyCycle(_duty(angle))
-            time.sleep(0.03)
+        if not self._pwm:
+            return
+        steps = 8
+        step_size = (angle - self._angle) / steps if steps else 0
+        for _ in range(steps):
+            self._angle += step_size
+            self._pwm.ChangeDutyCycle(_duty(self._angle))
+            time.sleep(0.02)
+        self._angle = angle
+        self._pwm.ChangeDutyCycle(_duty(angle))
+        time.sleep(0.02)
 
     def _idle(self):
         if self._pwm:
