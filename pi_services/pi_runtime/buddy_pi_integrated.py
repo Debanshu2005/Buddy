@@ -112,6 +112,9 @@ class BuddyIntegratedPi:
         self.current_detections = []
         self.last_faces = []
         self.persistent_objects: set[str] = set()
+        self._last_logged_face_present: Optional[bool] = None
+        self._last_logged_recognized_name: Optional[str] = None
+        self._last_logged_objects: tuple[str, ...] = ()
         self._thinking_token: Optional[str] = None
         self._camera_thread: Optional[threading.Thread] = None
         self._notif_queue: list[dict] = []
@@ -657,10 +660,18 @@ class BuddyIntegratedPi:
             self.current_detections = self.object_detector.detect(frame)
             self.current_objects = [det["name"] for det in self.current_detections if det["name"] != "person"]
             self.persistent_objects.update(self.current_objects)
+            current_objects_key = tuple(sorted(set(self.current_objects)))
+            if current_objects_key != self._last_logged_objects:
+                if current_objects_key:
+                    print(f"Objects: {', '.join(current_objects_key)}")
+                self._last_logged_objects = current_objects_key
 
         if self.frame_count % self.settings.face_interval_frames == 0:
             self.last_faces = self.detector.detect(frame)
             if self.last_faces:
+                if self._last_logged_face_present is not True:
+                    print("Detected face")
+                    self._last_logged_face_present = True
                 largest = self.detector.get_largest_face(self.last_faces)
                 is_stable = self.stability.update(largest)
                 x, y, w, h = largest
@@ -671,6 +682,9 @@ class BuddyIntegratedPi:
                         name, confidence = self.recognizer.recognize(face_roi)
                         self.last_recognition_time = now
                         if name != "Unknown" and confidence > 0.45:
+                            if self._last_logged_recognized_name != name:
+                                print(f"Recognized: {name}")
+                                self._last_logged_recognized_name = name
                             if self.active_user != name:
                                 self.active_user = name
                                 reply = self._call_brain(
@@ -686,6 +700,8 @@ class BuddyIntegratedPi:
                             )
                             self._display_response(reply)
             else:
+                self._last_logged_face_present = False
+                self._last_logged_recognized_name = None
                 self.stability.reset()
 
         return self._draw_visualization(frame.copy())
