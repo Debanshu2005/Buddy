@@ -381,15 +381,18 @@ class BuddyPi:
         self.persistent_objects = set()
         print(f"✅ Object detection ready")
 
-        # Initialize hardware controllers - servo first
-        try:
-            self.servo = ServoController()
-            self.servo_enabled = True
-            self._servo_looking_up = False  # Track servo state for face detection
-        except Exception as e:
-            print(f"⚠️ Servo init failed: {e}")
-            self.servo = None
-            self.servo_enabled = False
+        # Servo commented out — re-enable when needed
+        # try:
+        #     self.servo = ServoController()
+        #     self.servo_enabled = True
+        #     self._servo_looking_up = False
+        # except Exception as e:
+        #     print(f"⚠️ Servo init failed: {e}")
+        #     self.servo = None
+        #     self.servo_enabled = False
+        self.servo = None
+        self.servo_enabled = False
+        self._servo_looking_up = False
 
         self.motors = MotorController(port=ARDUINO_PORT, baud=ARDUINO_BAUD)
         # Notify on obstacle detection from Arduino
@@ -853,18 +856,16 @@ class BuddyPi:
 
         processed = self._draw_visualization(frame, faces, name, confidence, self.current_detections)
 
-		# ── Servo: tilt camera based on face detection ────────────────────────
-        if hasattr(self, 'servo_enabled') and self.servo_enabled and self.servo and not self.servo._moving:
-            if face_detected and self._servo_looking_up:
-                # Face found → look center
-                print(f"📷 Face detected → servo CENTERING (was UP)")
-                self.servo.look_center(smooth=True)
-                self._servo_looking_up = False
-            elif not face_detected and not self._servo_looking_up:
-                # No face → look up to search
-                print(f"📷 No face → servo LOOKING UP (was centered)")
-                self.servo.look_up(smooth=True)
-                self._servo_looking_up = True
+        # Servo commented out
+        # if hasattr(self, 'servo_enabled') and self.servo_enabled and self.servo and not self.servo._moving:
+        #     if face_detected and self._servo_looking_up:
+        #         print(f"📷 Face detected → servo CENTERING (was UP)")
+        #         self.servo.look_center(smooth=True)
+        #         self._servo_looking_up = False
+        #     elif not face_detected and not self._servo_looking_up:
+        #         print(f"📷 No face → servo LOOKING UP (was centered)")
+        #         self.servo.look_up(smooth=True)
+        #         self._servo_looking_up = True
         return processed, face_detected, name, confidence
 
     def _process_objects(self, frame):
@@ -1112,7 +1113,7 @@ class BuddyPi:
         while self.running and not self.sleep_mode:
             text = listen() if _websockets_available else ""
             if not text:
-                continue
+                continue  # STT failed or silence — just retry
             t = text.lower()
             print(f"[IDLE] Heard: '{text}'")
             if any(w in t for w in self._WAKE_WORDS):
@@ -1349,6 +1350,8 @@ class BuddyPi:
         threading.Thread(target=self._startup_greeting, daemon=True).start()
 
         # Wake-word loop blocks here until sleep or shutdown
+        # Small delay so greeting gets a head start before wake word loop begins
+        time.sleep(0.5)
         self._wake_word_loop()
 
         if self.sleep_mode and self.running:
@@ -1409,14 +1412,14 @@ class BuddyPi:
         """Clean up resources"""
         self.running = False
 
-        # Servo cleanup — center then release GPIO
-        if hasattr(self, 'servo_enabled') and self.servo_enabled and self.servo:
-            try:
-                self.servo.look_center(smooth=False)
-                time.sleep(0.3)
-                self.servo.cleanup()
-            except Exception:
-                pass
+        # Servo cleanup commented out
+        # if hasattr(self, 'servo_enabled') and self.servo_enabled and self.servo:
+        #     try:
+        #         self.servo.look_center(smooth=False)
+        #         time.sleep(0.3)
+        #         self.servo.cleanup()
+        #     except Exception:
+        #         pass
 
         # Stop motors and close Serial before anything else
         if hasattr(self, 'motors'):
