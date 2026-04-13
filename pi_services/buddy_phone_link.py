@@ -40,7 +40,7 @@ from face_detector import FaceDetector
 from face_recognizer import FaceRecognizer
 from stability_tracker import StabilityTracker
 from objrecog.obj import ObjectDetector
-from servo_controller import ServoController
+# from servo_controller import ServoController
 from motor_controller import MotorController
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
@@ -52,7 +52,7 @@ os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 os.environ["OPENCV_VIDEOIO_DEBUG"]        = "0"
 
 # ── WebSocket STT config ──────────────────────────────────────────────────────
-STT_SERVER_IP = "192.168.0.169"
+STT_SERVER_IP = "192.168.0.105"
 STT_PORT      = 8765
 MIC_RATE      = 48000   # Native mic sample rate (arecord)
 TARGET_RATE   = 16000   # Rate the STT server expects
@@ -399,15 +399,15 @@ class BuddyPi:
         print("✅ Object detection ready")
 
         # ── Servo ─────────────────────────────────────────────────────────────
-        try:
-            self.servo             = ServoController()
-            self.servo_enabled     = True
-            self._servo_looking_up = False
-        except Exception as e:
-            print(f"⚠️ Servo init failed: {e}")
-            self.servo             = None
-            self.servo_enabled     = False
-            self._servo_looking_up = False
+        # try:
+        #     self.servo             = ServoController()
+        #     self.servo_enabled     = True
+        #     self._servo_looking_up = False
+        # except Exception as e:
+        #     print(f"⚠️ Servo init failed: {e}")
+        self.servo             = None
+        self.servo_enabled     = False
+        self._servo_looking_up = False
 
         # ── Motors ────────────────────────────────────────────────────────────
         self.motors = MotorController(port=ARDUINO_PORT, baud=ARDUINO_BAUD)
@@ -1013,13 +1013,13 @@ class BuddyPi:
             frame, faces, name, confidence, self.current_detections
         )
 
-        if self.servo_enabled and self.servo:
-            if face_detected and self._servo_looking_up:
-                self.servo.look_center(smooth=True)
-                self._servo_looking_up = False
-            elif not face_detected and not self._servo_looking_up:
-                self.servo.look_up(smooth=True)
-                self._servo_looking_up = True
+        # if self.servo_enabled and self.servo:
+        #     if face_detected and self._servo_looking_up:
+        #         self.servo.look_center(smooth=True)
+        #         self._servo_looking_up = False
+        #     elif not face_detected and not self._servo_looking_up:
+        #         self.servo.look_up(smooth=True)
+        #         self._servo_looking_up = True
 
         return processed, face_detected, name, confidence
 
@@ -1314,13 +1314,13 @@ class BuddyPi:
     def cleanup(self):
         self.running = False
 
-        if self.servo_enabled and self.servo:
-            try:
-                self.servo.look_center(smooth=False)
-                time.sleep(0.3)
-                self.servo.cleanup()
-            except Exception:
-                pass
+        # if self.servo_enabled and self.servo:
+        #     try:
+        #         self.servo.look_center(smooth=False)
+        #         time.sleep(0.3)
+        #         self.servo.cleanup()
+        #     except Exception:
+        #         pass
 
         if hasattr(self, 'motors'):
             try:
