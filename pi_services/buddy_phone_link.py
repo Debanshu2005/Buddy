@@ -99,7 +99,7 @@ def _vosk_listen_for_wake_word(mic_device: str, wake_words: list, is_speaking_fn
 
 
 
-STT_SERVER_IP = "192.168.0.105"
+STT_SERVER_IP = "10.32.50.62"
 STT_PORT      = 8765
 MIC_RATE      = 48000   # Native mic sample rate (arecord)
 TARGET_RATE   = 16000   # Rate the STT server expects
