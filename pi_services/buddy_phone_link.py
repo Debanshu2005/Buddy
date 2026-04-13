@@ -37,7 +37,7 @@ from phone_link import process_notification
 from config import Config
 from states import BuddyState, StateManager
 from opencv_face_detector import FaceDetector
-from face_recognizer import FaceRecognizer
+from local_face_recognizer import FaceRecognizer
 from stability_tracker import StabilityTracker
 from objrecog.obj import ObjectDetector
 # from servo_controller import ServoController
@@ -493,6 +493,9 @@ class BuddyPi:
         self._notif_lock     = threading.Lock()
         self._notif_queue    = []
         self._thinking_token = None
+        self._last_logged_face_present = None
+        self._last_logged_recognized_name = None
+        self._last_logged_objects = ()
 
         print("🤖 Buddy Pi Hardware Ready")
         self._start_phone_listener()
@@ -1011,6 +1014,9 @@ class BuddyPi:
         face_detected = len(faces) > 0
 
         if face_detected:
+            if self._last_logged_face_present is not True:
+                print("Detected face")
+                self._last_logged_face_present = True
             largest   = self.detector.get_largest_face(faces)
             is_stable = self.stability.update(largest)
             now       = time.time()
@@ -1023,6 +1029,9 @@ class BuddyPi:
                     )
                     print(f"🔍 Recognition → {name} ({confidence:.2f})")
                     if name != "Unknown" and confidence > self.recognition_threshold:
+                        if self._last_logged_recognized_name != name:
+                            print(f"Recognized: {name}")
+                            self._last_logged_recognized_name = name
                         if self.active_user != name:
                             print(f"✅ New user: {name}")
                             self.active_user = name
@@ -1034,6 +1043,8 @@ class BuddyPi:
                         print(f"❓ Not recognised (conf={confidence:.2f})")
                     self.last_recognition_time = now
         else:
+            self._last_logged_face_present = False
+            self._last_logged_recognized_name = None
             self.stability.reset()
 
         now = time.time()
