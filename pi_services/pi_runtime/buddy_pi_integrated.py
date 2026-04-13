@@ -125,6 +125,8 @@ class BuddyIntegratedPi:
         self.object_detector = None
         self.display_enabled = self.settings.display_enabled
         self._cleaned_up = False
+        self._stream_frame: Optional[bytes] = None
+        self._stream_lock = threading.Lock()
 
         self.aplay_device, self.usb_card_index = self._find_output_audio_device()
         self.arecord_device = self._find_input_audio_device()
@@ -813,6 +815,45 @@ class BuddyIntegratedPi:
         if not self.is_speaking:
             self.speak("Path is clear.")
 
+    def _start_stream_server(self, port: int = 8080):
+        buddy = self
+
+        class _StreamHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path != "/":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.end_headers()
+                try:
+                    while buddy.running:
+                        with buddy._stream_lock:
+                            jpg = buddy._stream_frame
+                        if jpg is None:
+                            time.sleep(0.05)
+                            continue
+                        self.wfile.write(
+                            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+                        )
+                        time.sleep(0.04)
+                except Exception:
+                    pass
+
+            def log_message(self, *args):
+                return
+
+        class _ThreadedServer(ThreadingMixIn, HTTPServer):
+            daemon_threads = True
+
+        def _run():
+            server = _ThreadedServer(("0.0.0.0", port), _StreamHandler)
+            self.logger.info("Camera stream at http://<pi-ip>:%s/", port)
+            server.serve_forever()
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _camera_loop(self):
         while self.running:
             if self.sleep_mode:
@@ -827,15 +868,12 @@ class BuddyIntegratedPi:
             self.last_frame = frame.copy()
             self.frame_count += 1
             processed = self._process_frame(frame)
-            if self.display_enabled:
-                try:
-                    cv2.imshow("Buddy Vision", processed)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        self.running = False
-                        break
-                except cv2.error as exc:
-                    self.display_enabled = False
-                    self.logger.warning("OpenCV display disabled: %s", exc)
+
+            ok, buf = cv2.imencode(".jpg", processed, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                with self._stream_lock:
+                    self._stream_frame = buf.tobytes()
+
             time.sleep(0.02)
 
     def _wake_loop(self):
@@ -876,6 +914,7 @@ class BuddyIntegratedPi:
     def run(self):
         self.running = True
         self._start_phone_listener()
+        self._start_stream_server(port=8080)
         self._camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
         self._camera_thread.start()
         self._wake_loop()
