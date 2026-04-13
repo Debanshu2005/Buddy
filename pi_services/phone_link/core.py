@@ -1,7 +1,4 @@
-from fastapi import APIRouter, Request
 from datetime import datetime
-
-router = APIRouter()
 
 _seen = set()
 
@@ -131,17 +128,3 @@ def process_notification(app_name: str, title: str, message: str) -> dict:
     }
 
 
-@router.post("/notify")
-async def receive_notification(req: Request):
-    data = await req.json()
-    result = process_notification(
-        data.get("app", "Unknown"),
-        data.get("title", ""),
-        data.get("message", ""),
-    )
-    return result
-
-
-@router.get("/")
-def home():
-    return {"message": "BUDDY phone link active"}

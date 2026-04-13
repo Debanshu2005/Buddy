@@ -1,3 +1,3 @@
-from .core import process_notification, router
+from .core import process_notification
 
-__all__ = ["process_notification", "router"]
+__all__ = ["process_notification"]

@@ -25,7 +25,7 @@ from scipy.signal import resample_poly
 
 # Phone notification integration
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "phone_link"))
-from phone_link import process_notification, router as phone_router
+from phone_link import process_notification
 
 # Serial port for Arduino motor controller
 ARDUINO_PORT = "/dev/ttyUSB0"   # change to /dev/ttyACM0 if needed
