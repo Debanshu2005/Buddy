@@ -37,7 +37,7 @@ from phone_link import process_notification
 from config import Config
 from states import BuddyState, StateManager
 from opencv_face_detector import FaceDetector
-from face_recognizer import FaceRecognizer
+from local_face_recognizer import FaceRecognizer
 from stability_tracker import StabilityTracker
 from objrecog.obj import ObjectDetector
 # from servo_controller import ServoController

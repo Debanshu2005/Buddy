@@ -177,7 +177,7 @@ class BuddyIntegratedPi:
             return
 
         from vision.opencv_face_detector import FaceDetector
-        from vision.face_recognizer import FaceRecognizer
+        from vision.local_face_recognizer import FaceRecognizer
         from vision.objrecog.obj import ObjectDetector
 
         self.detector = FaceDetector(self.config.cascade_path, self.config)
