@@ -48,9 +48,6 @@ from core.stability_tracker import StabilityTracker
 from hardware.motor_controller import MotorController
 from memory.pi_memory import delete_person
 from phone_link.core import process_notification
-from vision.face_detector import FaceDetector
-from vision.face_recognizer import FaceRecognizer
-from vision.objrecog.obj import ObjectDetector
 
 os.environ["LIBCAMERA_LOG_LEVELS"] = "*:ERROR"
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
@@ -118,6 +115,10 @@ class BuddyIntegratedPi:
         self._camera_thread: Optional[threading.Thread] = None
         self._notif_queue: list[dict] = []
         self._notif_lock = threading.Lock()
+        self.local_vision_enabled = False
+        self.detector = None
+        self.recognizer = None
+        self.object_detector = None
 
         self.aplay_device, self.usb_card_index = self._find_output_audio_device()
         self.arecord_device = self._find_input_audio_device()
@@ -125,10 +126,8 @@ class BuddyIntegratedPi:
         self._working_arecord_device: Optional[str] = None
 
         self._init_camera()
-        self.detector = FaceDetector(self.config.cascade_path, self.config)
-        self.recognizer = FaceRecognizer(self.config.model_path, self.config)
         self.stability = StabilityTracker(self.config)
-        self.object_detector = ObjectDetector(confidence_threshold=0.5)
+        self._init_local_vision()
         self.motors = MotorController(
             port=self.settings.arduino_port,
             baud=self.settings.arduino_baud,
@@ -146,6 +145,48 @@ class BuddyIntegratedPi:
             level=getattr(logging, self.config.log_level, logging.INFO),
             format=self.config.log_format,
         )
+
+    def _probe_local_vision_stack(self) -> bool:
+        if os.getenv("BUDDY_DISABLE_LOCAL_VISION", "0") == "1":
+            self.logger.warning("Local vision disabled by BUDDY_DISABLE_LOCAL_VISION=1")
+            return False
+
+        probe = (
+            "import onnxruntime\n"
+            "from insightface.app import FaceAnalysis\n"
+            "print('vision-ok')\n"
+        )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", probe],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20,
+                text=True,
+            )
+            if result.returncode == 0 and "vision-ok" in result.stdout:
+                return True
+            self.logger.warning("Local vision probe failed: %s", (result.stderr or result.stdout).strip())
+            return False
+        except Exception as exc:
+            self.logger.warning("Local vision probe exception: %s", exc)
+            return False
+
+    def _init_local_vision(self):
+        if not self._probe_local_vision_stack():
+            self.local_vision_enabled = False
+            self.logger.warning("Buddy will start without local face/object inference on this Pi.")
+            return
+
+        from vision.face_detector import FaceDetector
+        from vision.face_recognizer import FaceRecognizer
+        from vision.objrecog.obj import ObjectDetector
+
+        self.detector = FaceDetector(self.config.cascade_path, self.config)
+        self.recognizer = FaceRecognizer(self.config.model_path, self.config)
+        self.object_detector = ObjectDetector(confidence_threshold=0.5)
+        self.local_vision_enabled = True
+        self.logger.info("Local vision initialized successfully")
 
     def _init_camera(self):
         self.csi_frame_path = "/tmp/csi_frame.jpg"
@@ -477,6 +518,10 @@ class BuddyIntegratedPi:
         return ""
 
     def _register_multi_angle(self, name: str):
+        if not self.local_vision_enabled or self.detector is None or self.recognizer is None:
+            self.logger.warning("Skipping face registration because local vision is unavailable")
+            return
+
         poses = [
             ("front", "Great. Turn your face slowly to the left and hold still."),
             ("left", "Perfect. Now turn to the right and hold still."),
@@ -513,6 +558,9 @@ class BuddyIntegratedPi:
                 self._wait_for_tts()
 
     def _process_registration_request(self, text: str) -> bool:
+        if not self.local_vision_enabled:
+            return False
+
         name = self._extract_name(text)
         if not name:
             return False
@@ -589,6 +637,9 @@ class BuddyIntegratedPi:
         self.speak(reply)
 
     def _process_frame(self, frame: np.ndarray):
+        if not self.local_vision_enabled or self.detector is None or self.recognizer is None or self.object_detector is None:
+            return frame.copy()
+
         if self.frame_count % self.settings.object_interval_frames == 0:
             self.current_detections = self.object_detector.detect(frame)
             self.current_objects = [det["name"] for det in self.current_detections if det["name"] != "person"]
@@ -627,6 +678,11 @@ class BuddyIntegratedPi:
         return self._draw_visualization(frame.copy())
 
     def _draw_visualization(self, frame: np.ndarray) -> np.ndarray:
+        if not self.local_vision_enabled:
+            status = "Local vision disabled on this Pi"
+            cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            return frame
+
         if self.current_detections:
             frame = self.object_detector.draw_detections(frame, self.current_detections)
 
