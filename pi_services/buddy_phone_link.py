@@ -1128,6 +1128,10 @@ class BuddyPi:
 
         class _Handler(BaseHTTPRequestHandler):
             def do_POST(self):
+                if self.path not in ('/', '/notify'):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
                 length = int(self.headers.get('Content-Length', 0))
                 body   = self.rfile.read(length)
                 try:
@@ -1168,7 +1172,13 @@ class BuddyPi:
 
     def _on_phone_notification(self, notif: dict):
         if notif.get("decision") == "ignore" or self.sleep_mode:
+            print(f"📱 Notification ignored: {notif.get('app')} — {notif.get('message')}")
             return
+        print(f"📱 Notification received!")
+        print(f"   App     : {notif.get('app', '?')}")
+        print(f"   From    : {notif.get('sender', '?')}")
+        print(f"   Message : {notif.get('message', '?')}")
+        print(f"   Decision: {notif.get('decision', '?')}")
         with self._notif_lock:
             self._notif_queue.append(notif)
         if not self.is_speaking:
@@ -1192,6 +1202,7 @@ class BuddyPi:
                 f"phone — natural, short, no robotic phrasing."
             )
             print(f"📱 Notification from {app} ({sender}): {message}")
+            print(f"📤 Sending to LLM...")
             response = self._call_brain_service(prompt, recognized_user=self.active_user)
             if response and response.get("reply"):
                 self.speak(response["reply"])
