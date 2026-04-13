@@ -65,7 +65,7 @@ except Exception as e:
     print(f"⚠️ Vosk not available: {e} — falling back to STT wake word")
 
 
-def _vosk_listen_for_wake_word(mic_device: str, wake_words: list) -> bool:
+def _vosk_listen_for_wake_word(mic_device: str, wake_words: list, is_speaking_fn=None) -> bool:
     if not _vosk_available:
         return False
     import json
@@ -80,6 +80,10 @@ def _vosk_listen_for_wake_word(mic_device: str, wake_words: list) -> bool:
             raw = proc.stdout.read(8000)  # 250ms chunks
             if not raw:
                 break
+            # skip processing while buddy is speaking to avoid self-trigger
+            if is_speaking_fn and is_speaking_fn():
+                rec.Reset()
+                continue
             if rec.AcceptWaveform(raw):
                 text = json.loads(rec.Result()).get("text", "").lower()
             else:
@@ -729,7 +733,7 @@ class BuddyPi:
         print("👂 Waiting for 'Buddy'...")
         while self.running and not self.sleep_mode:
             if _vosk_available:
-                detected = _vosk_listen_for_wake_word(self.arecord_device, self._WAKE_WORDS)
+                detected = _vosk_listen_for_wake_word(self.arecord_device, self._WAKE_WORDS, lambda: self.is_speaking)
             else:
                 text     = listen(_WAKE_MAX_SPEECH) if _websockets_available else ""
                 detected = bool(text) and self._is_wake_word(text)
@@ -1273,7 +1277,7 @@ class BuddyPi:
         while self.running and self.sleep_mode:
             try:
                 if _vosk_available:
-                    if _vosk_listen_for_wake_word(self.arecord_device, self._WAKE_WORDS):
+                    if _vosk_listen_for_wake_word(self.arecord_device, self._WAKE_WORDS, lambda: self.is_speaking):
                         print("✅ [SLEEP] Wake word detected")
                         self._wake_up_and_restart()
                         break
