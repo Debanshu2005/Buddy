@@ -30,6 +30,12 @@ int           nodStep   = 0;
 unsigned long nodTimer  = 0;
 #define NOD_STEP_MS 200
 
+bool          thinking     = false;
+int           thinkStep    = 0;
+unsigned long thinkTimer   = 0;
+#define THINK_STEP_MS 400
+#define THINK_STEPS   6    // 3 back-and-forth cycles
+
 // ===== SETUP =====
 void setup() {
   Serial.begin(115200);
@@ -89,6 +95,7 @@ void applyCommand(String cmd) {
   else if (cmd == "R") moveRight();
   else if (cmd == "W") { wiggling = true; wiggleStep = 0; wiggleTimer = millis(); }
   else if (cmd == "N") { nodding  = true; nodStep    = 0; nodTimer    = millis(); }
+  else if (cmd == "T") { thinking = true; thinkStep  = 0; thinkTimer  = millis(); }
   else                   stopMotors();
 }
 
@@ -112,6 +119,27 @@ void updateNod() {
   }
 }
 
+// ===== THINK (back and forth) =====
+void updateThink() {
+  if (!thinking) return;
+  if (millis() - thinkTimer < THINK_STEP_MS) return;
+  thinkTimer = millis();
+
+  if (thinkStep >= THINK_STEPS) {
+    thinking = false;
+    thinkStep = 0;
+    stopMotors();
+    runningCommand = "S";
+    Serial.println("THINK_DONE");
+    return;
+  }
+
+  // alternate F and B each step
+  if (thinkStep % 2 == 0) moveForward();
+  else                     moveBackward();
+  thinkStep++;
+}
+
 // ===== LOOP =====
 void loop() {
   // Your code here
@@ -121,5 +149,6 @@ void loop() {
   }
   updateWiggle();
   updateNod();
+  updateThink();
   delay(10);
 }

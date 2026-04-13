@@ -51,12 +51,12 @@ class MotorController:
         "delighted":    "W",
         "proud":        "W",
         "enthusiastic": "W",
-        # Thinking / uncertain → nod
-        "thinking":     "N",
-        "confused":     "N",
-        "uncertain":    "N",
-        "pondering":    "N",
-        "thoughtful":   "N",
+        # Thinking / uncertain → think back-and-forth
+        "thinking":     "T",
+        "confused":     "T",
+        "uncertain":    "T",
+        "pondering":    "T",
+        "thoughtful":   "T",
         # Curious → pan left-right (short, self-stopping)
         "curious":      "PAN",
         "interested":   "PAN",
@@ -154,7 +154,7 @@ class MotorController:
                 self._send_raw("R"); time.sleep(0.35)
                 self._send_raw("S")
                 print(f"🎭 Pan done for '{e}'")
-            elif cmd in ("W", "N"):
+            elif cmd in ("W", "N", "T"):
                 # Arduino handles full animation, sends WIGGLE_DONE/NOD_DONE when done
                 self._send_raw(cmd)
                 print(f"🎭 Animation '{cmd}' sent for '{e}'")
@@ -262,7 +262,7 @@ class MotorController:
                             except Exception:
                                 pass
 
-                    elif line in ("WIGGLE_DONE", "NOD_DONE"):
+                    elif line in ("WIGGLE_DONE", "NOD_DONE", "THINK_DONE"):
                         print(f"✅ Animation done: {line}")
                         self._current_cmd = "S"
 

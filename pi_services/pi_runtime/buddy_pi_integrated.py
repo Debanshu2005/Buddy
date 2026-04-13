@@ -503,6 +503,7 @@ class BuddyIntegratedPi:
         token = f"{time.time()}-{random.random()}"
         self._thinking_token = token
         self._eye(EyeState.THINKING)
+        self.motors.emotion_move("thinking")
 
         def _run():
             time.sleep(1.2)
