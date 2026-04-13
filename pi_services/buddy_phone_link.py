@@ -26,8 +26,6 @@ from scipy.signal import resample_poly
 # Phone notification integration
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "phone_link"))
 from phone_link import process_notification, router as phone_router
-from fastapi import FastAPI
-import uvicorn
 
 # Serial port for Arduino motor controller
 ARDUINO_PORT = "/dev/ttyUSB0"   # change to /dev/ttyACM0 if needed
@@ -701,38 +699,52 @@ class BuddyPi:
             return None
 
     def _start_phone_listener(self):
-        """Start FastAPI phone notification server in a background thread."""
-        _buddy = self
+        """Lightweight HTTP server for phone notifications — no FastAPI/uvicorn needed."""
+        import json
+        from http.server import BaseHTTPRequestHandler, HTTPServer
 
-        phone_app = FastAPI()
+        buddy = self
 
-        # Override the /notify endpoint to hook into buddy
-        from fastapi import Request
-        @phone_app.post("/notify")
-        async def notify(req: Request):
-            data = await req.json()
-            result = process_notification(
-                data.get("app", "Unknown"),
-                data.get("title", ""),
-                data.get("message", ""),
-            )
-            if result["status"] == "received":
-                threading.Thread(
-                    target=_buddy._on_phone_notification,
-                    args=(result,),
-                    daemon=True
-                ).start()
-            return result
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length', 0))
+                body   = self.rfile.read(length)
+                try:
+                    data   = json.loads(body)
+                    result = process_notification(
+                        data.get('app', 'Unknown'),
+                        data.get('title', ''),
+                        data.get('message', ''),
+                    )
+                    if result['status'] == 'received':
+                        threading.Thread(
+                            target=buddy._on_phone_notification,
+                            args=(result,), daemon=True
+                        ).start()
+                    resp = json.dumps(result).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(resp)
+                except Exception as e:
+                    self.send_response(400)
+                    self.end_headers()
 
-        @phone_app.get("/")
-        def home():
-            return {"message": "BUDDY phone link active"}
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"message":"BUDDY phone link active"}')
+
+            def log_message(self, *args):
+                pass  # suppress request logs
 
         def _run():
-            uvicorn.run(phone_app, host="0.0.0.0", port=8001, log_level="error")
+            server = HTTPServer(('0.0.0.0', 8001), _Handler)
+            server.serve_forever()
 
         threading.Thread(target=_run, daemon=True).start()
-        print("📱 Phone notification listener started on port 8001")
+        print('Phone notification listener started on port 8001')
 
     def _on_phone_notification(self, notif: dict):
         """Queue notification and speak when buddy is free."""
