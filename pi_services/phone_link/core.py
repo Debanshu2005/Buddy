@@ -119,6 +119,7 @@ def process_notification(app_name: str, title: str, message: str) -> dict:
 
     return {
         "status": "received",
+        "app": app_name,
         "decision": decision,
         "sender": sender,
         "message": msg,

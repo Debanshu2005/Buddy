@@ -66,11 +66,10 @@ except Exception as e:
 
 
 def _vosk_listen_for_wake_word(mic_device: str, wake_words: list) -> bool:
-    """
-    Blocking. Reads raw 16kHz mic chunks, runs Vosk locally.
-    Returns True the moment any wake word is spotted. Zero network calls.
-    """
+    if not _vosk_available:
+        return False
     import json
+    from vosk import KaldiRecognizer
     rec  = KaldiRecognizer(_vosk_model, 16000)
     proc = subprocess.Popen(
         ["arecord", "-D", mic_device, "-f", "S16_LE", "-r", "16000", "-c", "1"],
@@ -1136,11 +1135,13 @@ class BuddyPi:
                 body   = self.rfile.read(length)
                 try:
                     data   = json.loads(body)
+                    print(f"\n📥 Raw notification received: {data}")
                     result = process_notification(
                         data.get('app', 'Unknown'),
                         data.get('title', ''),
                         data.get('message', ''),
                     )
+                    print(f"📋 Processed: {result}")
                     if result['status'] == 'received':
                         threading.Thread(
                             target=buddy._on_phone_notification,
@@ -1151,7 +1152,8 @@ class BuddyPi:
                     self.send_header('Content-Type', 'application/json')
                     self.end_headers()
                     self.wfile.write(resp)
-                except Exception:
+                except Exception as e:
+                    print(f"❌ Notification handler error: {e}")
                     self.send_response(400)
                     self.end_headers()
 
