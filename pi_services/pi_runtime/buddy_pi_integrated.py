@@ -153,11 +153,7 @@ class BuddyIntegratedPi:
             self.logger.warning("Local vision disabled by BUDDY_DISABLE_LOCAL_VISION=1")
             return False
 
-        probe = (
-            "import onnxruntime\n"
-            "from insightface.app import FaceAnalysis\n"
-            "print('vision-ok')\n"
-        )
+        probe = "import onnxruntime\nprint('vision-ok')\n"
         try:
             result = subprocess.run(
                 [sys.executable, "-c", probe],
@@ -180,7 +176,7 @@ class BuddyIntegratedPi:
             self.logger.warning("Buddy will start without local face/object inference on this Pi.")
             return
 
-        from vision.face_detector import FaceDetector
+        from vision.opencv_face_detector import FaceDetector
         from vision.face_recognizer import FaceRecognizer
         from vision.objrecog.obj import ObjectDetector
 
