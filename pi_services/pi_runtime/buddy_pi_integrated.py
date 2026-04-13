@@ -481,7 +481,44 @@ class BuddyIntegratedPi:
             self._listen_loop = None
             return ""
 
+    def _force_face_recognition(self) -> Optional[str]:
+        try:
+            ok, frame = self._read_frame()
+            if not ok or frame is None or not self.local_vision_enabled:
+                return None
+            faces = self.detector.detect(frame)
+            if not faces:
+                return None
+            for (x, y, w, h) in faces:
+                if w > 80 and h > 80:
+                    name, conf = self.recognizer.recognize(frame[y:y + h, x:x + w])
+                    if name != "Unknown" and conf > 0.4:
+                        print(f"Recognized: {name}")
+                        return name
+        except Exception as exc:
+            self.logger.warning("Force recognition error: %s", exc)
+        return None
+
     def _call_brain(self, user_input: str, recognized_user: Optional[str] = None) -> dict:
+        user_lower = user_input.lower()
+
+        identity_patterns = [
+            "who am i", "who is this", "who is here", "who do you see",
+            "recognize me", "can you see me", "do you know me", "identify me",
+        ]
+        if any(p in user_lower for p in identity_patterns):
+            found = self._force_face_recognition()
+            if found:
+                recognized_user = found
+
+        if any(p in user_lower for p in ("what is", "what do you see", "in my hand", "holding")):
+            ok, frame = self._read_frame()
+            if ok and frame is not None and self.local_vision_enabled and self.object_detector:
+                fresh = self.object_detector.detect(frame)
+                if fresh:
+                    self.current_objects = [d["name"] for d in fresh if d["name"] != "person"]
+                    self.persistent_objects.update(self.current_objects)
+
         objects = list(self.current_objects or self.persistent_objects)
         try:
             response = requests.post(
@@ -650,9 +687,25 @@ class BuddyIntegratedPi:
         if not response:
             return
         reply = response.get("reply", "")
+        raw = response.get("raw_response", "")
         intent = response.get("intent", "conversation")
-        if intent == "stop":
+        emotion = response.get("emotion", "")
+        print(f"\nBuddy: {raw if raw else reply}")
+        if intent != "conversation":
+            print(f"[INTENT: {intent}]")
+        _brain_move = {
+            "move_forward": "F", "move_backward": "B",
+            "move_left": "L", "move_right": "R", "stop": "S",
+        }
+        if intent in _brain_move:
+            cmd = _brain_move[intent]
+            self.motors.move(cmd, None if cmd == "S" else 1.5)
+        elif intent == "stop":
             self.motors.stop()
+        if emotion:
+            print(f"[EMOTION: {emotion}]")
+            if self.motors.is_connected():
+                threading.Timer(0.3, lambda e=emotion: self.motors.emotion_move(e)).start()
         self.speak(reply)
 
     def _process_frame(self, frame: np.ndarray):
@@ -820,26 +873,32 @@ class BuddyIntegratedPi:
 
         class _StreamHandler(BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path != "/":
+                if self.path == "/":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(b"<html><body><img src='/stream'></body></html>")
+                elif self.path == "/stream":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                    self.end_headers()
+                    try:
+                        while buddy.running:
+                            with buddy._stream_lock:
+                                jpg = buddy._stream_frame
+                            if jpg is None:
+                                time.sleep(0.05)
+                                continue
+                            self.wfile.write(
+                                b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+                            )
+                            self.wfile.flush()
+                            time.sleep(0.04)
+                    except Exception:
+                        pass
+                else:
                     self.send_response(404)
                     self.end_headers()
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-                self.end_headers()
-                try:
-                    while buddy.running:
-                        with buddy._stream_lock:
-                            jpg = buddy._stream_frame
-                        if jpg is None:
-                            time.sleep(0.05)
-                            continue
-                        self.wfile.write(
-                            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-                        )
-                        time.sleep(0.04)
-                except Exception:
-                    pass
 
             def log_message(self, *args):
                 return
@@ -849,7 +908,8 @@ class BuddyIntegratedPi:
 
         def _run():
             server = _ThreadedServer(("0.0.0.0", port), _StreamHandler)
-            self.logger.info("Camera stream at http://<pi-ip>:%s/", port)
+            buddy.logger.info("Camera stream at http://<pi-ip>:%s/", port)
+            print(f"📷 Camera stream: http://<pi-ip>:{port}/")
             server.serve_forever()
 
         threading.Thread(target=_run, daemon=True).start()
@@ -867,7 +927,11 @@ class BuddyIntegratedPi:
 
             self.last_frame = frame.copy()
             self.frame_count += 1
-            processed = self._process_frame(frame)
+
+            if self.frame_count % 5 == 0:
+                processed = self._process_frame(frame)
+            else:
+                processed = frame
 
             ok, buf = cv2.imencode(".jpg", processed, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
@@ -876,10 +940,11 @@ class BuddyIntegratedPi:
 
             time.sleep(0.02)
 
-    def _wake_loop(self):
+    def _startup_greeting(self):
+        time.sleep(1.0)
         self.speak("Hey. I am Buddy. Call me anytime.")
-        self._wait_for_tts()
 
+    def _wake_loop(self):
         while self.running:
             if self.sleep_mode:
                 text = self.listen_for_speech()
@@ -917,6 +982,8 @@ class BuddyIntegratedPi:
         self._start_stream_server(port=8080)
         self._camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
         self._camera_thread.start()
+        threading.Thread(target=self._startup_greeting, daemon=True).start()
+        time.sleep(0.5)
         self._wake_loop()
 
     def cleanup(self):
