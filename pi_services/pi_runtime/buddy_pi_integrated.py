@@ -46,6 +46,7 @@ from scipy.signal import resample_poly
 from core.config import Config
 from core.stability_tracker import StabilityTracker
 from hardware.motor_controller import MotorController
+from hardware.oled_eyes import OledEyes, EyeState
 from memory.pi_memory import delete_person
 from phone_link.core import process_notification
 
@@ -139,6 +140,12 @@ class BuddyIntegratedPi:
 
         self.tts_voice = "en-IN-NeerjaNeural"
         self.speech_enabled = True
+
+        self.eyes: Optional[OledEyes] = None
+        try:
+            self.eyes = OledEyes()
+        except Exception as exc:
+            self.logger.warning("OLED eyes unavailable: %s", exc)
 
         atexit.register(self.cleanup)
 
@@ -300,10 +307,15 @@ class BuddyIntegratedPi:
         except Exception as exc:
             self.logger.warning("Listen beep failed: %s", exc)
 
+    def _eye(self, state: EyeState):
+        if self.eyes:
+            self.eyes.set_state(state)
+
     def speak(self, text: str):
         if not text.strip():
             return
         self.is_speaking = True
+        self._eye(EyeState.SPEAKING)
 
         def _run():
             try:
@@ -315,6 +327,7 @@ class BuddyIntegratedPi:
                 self.logger.warning("TTS failed: %s", exc)
             finally:
                 self.is_speaking = False
+                self._eye(EyeState.IDLE)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -489,6 +502,7 @@ class BuddyIntegratedPi:
     def _play_thinking_sound(self):
         token = f"{time.time()}-{random.random()}"
         self._thinking_token = token
+        self._eye(EyeState.THINKING)
 
         def _run():
             time.sleep(1.2)
@@ -615,6 +629,7 @@ class BuddyIntegratedPi:
             self.speak("Going to sleep. Say hey buddy to wake me up.")
             self._wait_for_tts()
             self.sleep_mode = True
+            self._eye(EyeState.SLEEPING)
             return
 
         if self._process_registration_request(text):
@@ -815,6 +830,7 @@ class BuddyIntegratedPi:
                 text = self.listen_for_speech()
                 if text and any(word in text.lower() for word in self._WAKE_WORDS):
                     self.sleep_mode = False
+                    self._eye(EyeState.WAKING)
                     self.speak("I am awake. What can I do for you?")
                     self._wait_for_tts()
                 continue
@@ -828,7 +844,9 @@ class BuddyIntegratedPi:
                 continue
 
             self._play_listen_beep()
+            self._eye(EyeState.LISTENING)
             user_text = self.listen_for_speech()
+            self._eye(EyeState.IDLE)
             if user_text:
                 self._process_input(user_text)
                 self._wait_for_tts()
@@ -850,6 +868,11 @@ class BuddyIntegratedPi:
             return
         self._cleaned_up = True
         self.running = False
+        if self.eyes:
+            try:
+                self.eyes.stop()
+            except Exception:
+                pass
         try:
             self.motors.cleanup()
         except Exception:
