@@ -119,6 +119,8 @@ class BuddyIntegratedPi:
         self.detector = None
         self.recognizer = None
         self.object_detector = None
+        self.display_enabled = self.settings.display_enabled
+        self._cleaned_up = False
 
         self.aplay_device, self.usb_card_index = self._find_output_audio_device()
         self.arecord_device = self._find_input_audio_device()
@@ -797,11 +799,15 @@ class BuddyIntegratedPi:
             self.last_frame = frame.copy()
             self.frame_count += 1
             processed = self._process_frame(frame)
-            if self.settings.display_enabled:
-                cv2.imshow("Buddy Vision", processed)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    self.running = False
-                    break
+            if self.display_enabled:
+                try:
+                    cv2.imshow("Buddy Vision", processed)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        self.running = False
+                        break
+                except cv2.error as exc:
+                    self.display_enabled = False
+                    self.logger.warning("OpenCV display disabled: %s", exc)
             time.sleep(0.02)
 
     def _wake_loop(self):
@@ -844,6 +850,9 @@ class BuddyIntegratedPi:
         self._wake_loop()
 
     def cleanup(self):
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
         self.running = False
         try:
             self.motors.cleanup()
