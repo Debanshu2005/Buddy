@@ -531,24 +531,28 @@ class BuddyPi:
     # ── Alexa-style beep ─────────────────────────────────────────────────────
 
     def _play_listen_beep(self):
-        """
-        Two-tone rising chime via pygame (880 Hz → 1100 Hz, 120 ms each).
-        Plays immediately so the user knows to start speaking — just like Alexa.
-        Silent fallback if pygame is not initialised.
-        """
+        """Two-tone rising chime written directly to a WAV and played via aplay."""
         try:
-            if not pygame.mixer.get_init():
-                return
+            import wave, struct
             sample_rate = 22050
-            for freq in (880, 1100):
-                n      = int(sample_rate * 0.12)
-                t      = np.linspace(0, 0.12, n, endpoint=False)
-                wave   = (np.sin(2 * np.pi * freq * t) * 14000).astype(np.int16)
-                stereo = np.column_stack([wave, wave])
-                pygame.sndarray.make_sound(stereo).play()
-                time.sleep(0.14)   # 120 ms tone + 20 ms gap
-        except Exception:
-            pass
+            wav_path    = "/tmp/buddy_beep.wav"
+            frames      = []
+            for freq, dur in ((880, 0.12), (1100, 0.15)):
+                n = int(sample_rate * dur)
+                for i in range(n):
+                    val = int(14000 * np.sin(2 * np.pi * freq * i / sample_rate))
+                    frames.append(struct.pack('<h', val))
+            with wave.open(wav_path, 'w') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(b''.join(frames))
+            subprocess.Popen(
+                ["aplay", "-D", self.aplay_device, "-q", wav_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            ).wait()
+        except Exception as e:
+            print(f"⚠️ Beep failed: {e}")
 
     # ── TTS ──────────────────────────────────────────────────────────────────
 
@@ -655,52 +659,51 @@ class BuddyPi:
 
     # ── Alexa-style wake-word loop ────────────────────────────────────────────
 
+    def _strip_wake_word(self, text: str) -> str:
+        """Remove the wake word from the start of the transcript, return remainder."""
+        t = text.lower().strip()
+        for w in sorted(self._WAKE_WORDS, key=len, reverse=True):  # longest first
+            if t.startswith(w):
+                return text[len(w):].strip().strip(",. ")
+        return text
+
     def _wake_word_loop(self):
         """
         Idle loop — streams audio continuously via VAD.
-        On silence / non-wake-word: immediately loops back.
-        On wake word detected:
-          1. Plays two-tone beep  ← user knows to speak NOW
-          2. Opens follow-up conversation turns (no wake word needed again)
-          3. Returns to idle
+        - "Hey Buddy what time is it" → strips wake word → sends to LLM directly
+        - "Hey Buddy" (alone)         → beep → listen once → send to LLM
+        - After answering, always returns to idle (wake word required again)
         """
         print("👂 Idle — waiting for 'Hey Buddy'...")
         while self.running and not self.sleep_mode:
             text = listen() if _websockets_available else ""
             if not text:
-                continue   # VAD returned silence — instant retry, no CPU burn
+                continue
 
             t = text.lower()
             print(f"[IDLE] Heard: '{text}'")
 
-            if any(w in t for w in self._WAKE_WORDS):
-                print("✅ Wake word! Starting conversation.")
-                self._play_listen_beep()          # ← Alexa-style chime
-                self._convo_turns(_CONVO_TURNS)
-                print("👂 Back to wake-word listening...")
+            if not any(w in t for w in self._WAKE_WORDS):
+                continue
 
-    def _convo_turns(self, turns_left: int):
-        """
-        Handle up to `turns_left` follow-up turns without wake word.
-        Beep plays before each turn so the user always knows when to speak.
-        """
-        if not self.running or self.sleep_mode or turns_left <= 0:
-            return
+            print("✅ Wake word detected")
+            remainder = self._strip_wake_word(text)
 
-        # First turn: beep already played by _wake_word_loop before this call.
-        # Subsequent turns: play beep again to signal "still listening".
-        if turns_left < _CONVO_TURNS:
-            self._play_listen_beep()
+            if remainder:
+                # Query came in the same utterance — process immediately
+                print(f"[INLINE] Query: '{remainder}'")
+                self._play_listen_beep()
+                self._process_input(remainder)
+                self._wait_for_tts()
+            else:
+                # Just the wake word — beep and listen for the query
+                self._play_listen_beep()
+                user_text = self.listen_for_speech()
+                if user_text:
+                    self._process_input(user_text)
+                    self._wait_for_tts()
 
-        user_text = self.listen_for_speech()
-        if not user_text:
-            return   # silence — user is done, return to idle quietly
-
-        self._process_input(user_text)
-
-        if not self.sleep_mode and self.running and turns_left > 1:
-            self._wait_for_tts()
-            self._convo_turns(turns_left - 1)
+            print("👂 Back to wake-word listening...")
 
     # ── Brain service ─────────────────────────────────────────────────────────
 
