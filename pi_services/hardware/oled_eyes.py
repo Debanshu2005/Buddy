@@ -174,3 +174,28 @@ class OledEyes:
 
             _render(self._device, left, right)
             time.sleep(0.05)
+
+
+if __name__ == "__main__":
+    print("Testing OLED eyes on NFP1315-61AY — Ctrl+C to stop")
+    eyes = OledEyes()
+    sequence = [
+        (EyeState.IDLE,      "IDLE      — normal blinking eyes", 3),
+        (EyeState.LISTENING, "LISTENING — wider eyes",           3),
+        (EyeState.THINKING,  "THINKING  — eyes look up-left",    3),
+        (EyeState.SPEAKING,  "SPEAKING  — gentle bob",           3),
+        (EyeState.HAPPY,     "HAPPY     — squinting eyes",       3),
+        (EyeState.SURPRISED, "SURPRISED — big wide eyes",        3),
+        (EyeState.SLEEPING,  "SLEEPING  — eyes closed",          3),
+        (EyeState.WAKING,    "WAKING    — eyes open animation",  2),
+    ]
+    try:
+        for state, label, duration in sequence:
+            print(f"  {label}")
+            eyes.set_state(state)
+            time.sleep(duration)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        eyes.stop()
+        print("Done.")
