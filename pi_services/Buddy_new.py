@@ -24,14 +24,14 @@ ARDUINO_PORT = "/dev/ttyUSB0"   # change to /dev/ttyACM0 if needed
 ARDUINO_BAUD = 115200
 
 # Hardware modules only
-from config import Config
-from states import BuddyState, StateManager
-from face_detector import FaceDetector
-from face_recognizer import FaceRecognizer
-from stability_tracker import StabilityTracker
-from objrecog.obj import ObjectDetector
-from servo_controller import ServoController
-from motor_controller import MotorController
+from core.config import Config
+from core.states import BuddyState, StateManager
+from vision.face_detector import FaceDetector
+from vision.face_recognizer import FaceRecognizer
+from core.stability_tracker import StabilityTracker
+from vision.objrecog.obj import ObjectDetector
+from hardware.servo_controller import ServoController
+from hardware.motor_controller import MotorController
 
 # ── WebSocket STT ────────────────────────────────────────────────────────────
 # Recording uses arecord (ALSA command-line tool) instead of sounddevice so
@@ -410,6 +410,7 @@ class BuddyPi:
         self._obstacle_detected = False
         self.max_attempts = 5
         self.recognition_threshold = 0.4
+        self._awaiting_name = False  # True when buddy asked a stranger for their name
 
         print("🤖 Buddy Pi Hardware Ready")
 
@@ -435,7 +436,7 @@ class BuddyPi:
             print("📷 Starting CSI camera helper...")
             try:
                 self.csi_process = subprocess.Popen(
-                    ["/usr/bin/python3", "csi_camera_helper.py"],
+                    ["/usr/bin/python3", str(Path(__file__).resolve().parent / "hardware" / "csi_camera_helper.py")],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
                 )
@@ -512,27 +513,25 @@ class BuddyPi:
         print(f"✅ Speech system ready (WebSocket STT @ {STT_SERVER_IP}:{STT_PORT} + Edge TTS via USB mic, card {self.usb_card_index})")
 
     def _startup_greeting(self):
-        """Detect and greet person on startup with robust recognition"""
+        """On startup: recognize known face and greet by name, or ask stranger for their name"""
         try:
             print("Starting camera and face recognition...")
             time.sleep(1.0)
 
-            recognition_attempts = {}
+            recognition_counts = {}
 
-            for attempt in range(50):
+            for _ in range(60):
                 ret, frame = self._read_frame()
                 if not ret:
                     continue
 
                 faces = self.detector.detect(frame)
-
                 if faces:
                     largest_face = self.detector.get_largest_face(faces)
                     is_stable = self.stability.update(largest_face)
                     x, y, w, h = largest_face
 
-                    processed = self._draw_visualization(frame, faces)
-                    cv2.imshow('Buddy Vision', processed)
+                    cv2.imshow('Buddy Vision', self._draw_visualization(frame, faces))
                     cv2.waitKey(1)
 
                     if w > 80 and h > 80 and is_stable:
@@ -540,36 +539,27 @@ class BuddyPi:
                         name, confidence = self.face_recognizer.recognize(face_roi)
 
                         if name != "Unknown" and confidence > self.recognition_threshold:
-                            if name not in recognition_attempts:
-                                recognition_attempts[name] = 0
-                            recognition_attempts[name] += 1
-
-                            if recognition_attempts[name] >= 3:
+                            recognition_counts[name] = recognition_counts.get(name, 0) + 1
+                            # Need 3 consistent recognitions to confirm
+                            if recognition_counts[name] >= 3:
                                 self.active_user = name
-                                print(f"✅ Recognized: {name}")
-
+                                print(f"✅ Recognized: {name} ({confidence:.2f})")
                                 response = self._call_brain_service(
-                                    "Hello! Nice to see you!",
+                                    f"You just saw {name} and recognized them. Greet them warmly by name.",
                                     recognized_user=name
                                 )
                                 self._display_response(response)
                                 return
 
-                        total_attempts = sum(recognition_attempts.values())
-                        if total_attempts >= self.max_attempts and not self.active_user:
-                            print("❓ Unknown person after multiple attempts")
-                            response = self._call_brain_service(
-                                "I can see someone but don't recognize them. Greet them politely and ask their name.",
-                                recognized_user=None
-                            )
-                            self._display_response(response)
-                            return
-
                 time.sleep(0.1)
 
-            # Fallback greeting
-            print("Starting general interaction")
-            response = self._call_brain_service("Hello! I'm ready to chat!")
+            # No known face found — greet as stranger and ask for name
+            print("❓ Unknown person — asking for name")
+            self._awaiting_name = True
+            response = self._call_brain_service(
+                "You see someone but don't recognize them. Say hi and ask for their name politely.",
+                recognized_user=None
+            )
             self._display_response(response)
 
         except Exception as e:
@@ -1066,43 +1056,49 @@ class BuddyPi:
     def _process_input(self, user_text):
         """Process user input.
 
-        1. Try to parse a movement intent locally (instant, no brain call).
-        2. If it's a movement command → execute + short TTS + return.
-        3. Otherwise → brain service for conversation / questions.
+        1. Movement command → execute locally, skip brain.
+        2. Name introduction while awaiting name → register face + greet by name.
+        3. Everything else → brain service.
         """
         try:
             text_lower = user_text.lower()
 
-            # ── Step 1: parse movement from free-form text ─────────────────
+            # ── Step 1: movement command ──────────────────────────────────────
             parsed = self._parse_movement_intent(text_lower)
-
-            # ── Step 2: motor command → execute locally, skip brain ──────────
             if parsed is not None:
                 cmd, duration = parsed
                 print(f"🎙️ Motor: {cmd!r}  duration={duration}")
                 self._execute_movement(cmd, duration)
-                confirmation = self._MOTOR_CONFIRMATIONS.get(cmd, "On it.")
-                self.speak(confirmation)
+                self.speak(self._MOTOR_CONFIRMATIONS.get(cmd, "On it."))
                 threading.Timer(1.5, self._delayed_listening).start()
                 return
 
-            # ── Step 3: non-motor — register name if introduced ───────────────
+            # ── Step 2: name introduction → register face ─────────────────────
             if any(phrase in text_lower for phrase in ['my name is', 'i am', "i'm"]):
                 name = self._extract_name(user_text)
                 if name and len(name.split()) == 1 and name.isalpha() and len(name) > 1:
                     if self.active_user != name:
+                        registered = False
                         if hasattr(self, 'last_frame') and self.last_frame is not None:
                             faces = self.detector.detect(self.last_frame)
                             if faces:
-                                largest_face = self.detector.get_largest_face(faces)
-                                x, y, w, h = largest_face
+                                x, y, w, h = self.detector.get_largest_face(faces)
                                 if w > 80 and h > 80:
                                     face_roi = self.last_frame[y:y+h, x:x+w]
-                                    if self.face_recognizer.add_face(name, face_roi):
-                                        self.active_user = name
-                                        print(f"Registered new face for: {name}")
+                                    registered = self.face_recognizer.add_face(name, face_roi)
 
-            # ── Step 5: everything else goes to the brain ─────────────────────
+                        self.active_user = name
+                        self._awaiting_name = False
+                        print(f"✅ Registered face for: {name}")
+
+                        response = self._call_brain_service(
+                            f"The person just told you their name is {name}. {'You saved their face so you will recognize them next time. ' if registered else ''}Greet them warmly by name and start a friendly conversation.",
+                            recognized_user=name
+                        )
+                        self._display_response(response)
+                        return
+
+            # ── Step 3: everything else → brain ───────────────────────────────
             response = self._call_brain_service(user_text, self.active_user)
             self._display_response(response)
 

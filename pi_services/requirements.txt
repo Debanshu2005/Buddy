@@ -16,6 +16,16 @@ picamera2
 onnxruntime>=1.16.0
 
 # ===============================
+# Face Recognition (InsightFace ArcFace + RetinaFace)
+# ===============================
+insightface>=0.7.3
+
+# ===============================
+# Object Detection (YOLOv8n ONNX export)
+# ===============================
+ultralytics>=8.0.0
+
+# ===============================
 # Database
 # ===============================
 psycopg2-binary>=2.9.0
@@ -27,18 +37,11 @@ python-dotenv>=1.0.0
 requests>=2.31.0
 
 # ===============================
-# Speech Recognition and TTS (Offline)
+# Speech and TTS
 # ===============================
-vosk>=0.3.45
 edge-tts>=6.1.0
 pygame>=2.5.0
-pydub>=0.25.1
-
-# ===============================
-# Audio dependencies (Pi hardware)
-# ===============================
-pyaudio>=0.2.13
-sounddevice>=0.4.6
+websockets>=11.0
 
 # ===============================
 # Hardware control

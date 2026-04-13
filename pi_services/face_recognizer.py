@@ -1,118 +1,126 @@
 """
 Face Recognition Module
-Handles face recognition using ONNX model
+Uses InsightFace buffalo_sc w600k_mbf.onnx directly via ONNX Runtime
+Supports multiple embeddings per person (different angles)
 """
 
 import cv2
 import numpy as np
 import onnxruntime as ort
-from scipy.spatial.distance import cosine
+import os
 import logging
-import html
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, List
 from pi_memory import save_face, get_all_faces
+
+MODEL_PATH = os.path.join(
+    os.path.expanduser("~"), ".insightface", "models", "buffalo_sc", "w600k_mbf.onnx"
+)
 
 
 class FaceRecognizer:
-    """Handles face recognition using ONNX model"""
-    
+
     def __init__(self, model_path: str, config):
         self.config = config
         self.logger = logging.getLogger(__name__)
-        
-        # Load ONNX model
-        session_options = ort.SessionOptions()
-        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        session_options.intra_op_num_threads = 4
-        
-        providers = ['CPUExecutionProvider']
-        self.session = ort.InferenceSession(model_path, session_options, providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
-        
-        self.known_faces: Dict[str, np.ndarray] = {}
+        self.session = None
+        self.known_faces: Dict[str, List[np.ndarray]] = {}  # {name: [emb1, emb2, ...]}
+        self._init_model()
         self.load_known_faces()
-    
-    def preprocess_face(self, face_img: np.ndarray) -> np.ndarray:
-        """Preprocess face image for ONNX model - correct tensor shape"""
-        face_resized = cv2.resize(face_img, (112, 112))
-        face_normalized = (face_resized - 127.5) / 128.0
-        # Keep HWC format (112, 112, 3) instead of CHW
-        return np.expand_dims(face_normalized, axis=0).astype(np.float32)
-    
-    def get_embedding(self, face_img: np.ndarray) -> np.ndarray:
-        """Extract face embedding from image"""
-        preprocessed = self.preprocess_face(face_img)
-        embedding = self.session.run(None, {self.input_name: preprocessed})[0]
-        return embedding.flatten()
-    
-    def recognize(self, face_img: np.ndarray) -> Tuple[str, float]:
-        """Recognize a face from image"""
+
+    def _init_model(self):
+        if not os.path.exists(MODEL_PATH):
+            print(f"⚠️ Recognition model not found at {MODEL_PATH}")
+            return
         try:
-            # Enhance image
-            face_gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-            face_enhanced = cv2.equalizeHist(face_gray)
-            face_enhanced = cv2.cvtColor(face_enhanced, cv2.COLOR_GRAY2BGR)
-            
-            embedding = self.get_embedding(face_enhanced)
-            
+            opts = ort.SessionOptions()
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            opts.intra_op_num_threads = 4
+            self.session = ort.InferenceSession(
+                MODEL_PATH, opts, providers=["CPUExecutionProvider"]
+            )
+            self.input_name = self.session.get_inputs()[0].name
+            print("✅ Face recognizer ready (w600k_mbf ArcFace ONNX)")
+        except Exception as e:
+            self.logger.error(f"Face recognizer init failed: {e}")
+            self.session = None
+
+    def _preprocess_face(self, face_img: np.ndarray) -> np.ndarray:
+        resized = cv2.resize(face_img, (112, 112))
+        blob = (resized[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) - 127.5) / 127.5
+        return np.expand_dims(blob, 0)
+
+    def get_embedding(self, face_img: np.ndarray) -> Optional[np.ndarray]:
+        if self.session is None:
+            return None
+        try:
+            blob = self._preprocess_face(face_img)
+            emb = self.session.run(None, {self.input_name: blob})[0].flatten()
+            norm = np.linalg.norm(emb)
+            return emb / (norm + 1e-6)
+        except Exception as e:
+            self.logger.error(f"Embedding error: {e}")
+            return None
+
+    def recognize(self, face_img: np.ndarray) -> Tuple[str, float]:
+        """Compare against all stored angles, return best match"""
+        if self.session is None:
+            return "Unknown", 0.0
+        try:
+            embedding = self.get_embedding(face_img)
+            if embedding is None:
+                return "Unknown", 0.0
+
             if not self.known_faces:
                 return "Unknown", 0.0
-            
+
             best_match = None
-            min_distance = float('inf')
-            
-            for name, known_embedding in self.known_faces.items():
-                distance = cosine(embedding, known_embedding)
-                if distance < min_distance:
-                    min_distance = distance
-                    best_match = name
-            
-            confidence = 1 - min_distance
-            
-            if min_distance < self.config.recognition_threshold:
-                return best_match, confidence
-            
+            best_score = -1.0
+
+            for name, embeddings in self.known_faces.items():
+                for known_emb in embeddings:
+                    score = float(np.dot(embedding, known_emb))
+                    if score > best_score:
+                        best_score = score
+                        best_match = name
+
+            if best_score >= 0.45:
+                return best_match, best_score
+
             return "Unknown", 0.0
-            
+
         except Exception as e:
-            self.logger.error(f"Recognition error: {e}", exc_info=True)
+            self.logger.error(f"Recognition error: {e}")
             return "Unknown", 0.0
-    
-    def add_face(self, name: str, face_img: np.ndarray) -> bool:
-        """Add a new face to known faces"""
+
+    def add_face(self, name: str, face_img: np.ndarray, angle: str = "front") -> bool:
+        """Add a face embedding for a specific angle"""
         try:
-            print(f"DEBUG: add_face called for '{name}' with image shape {face_img.shape}")
             embedding = self.get_embedding(face_img)
-            print(f"DEBUG: Generated embedding shape: {embedding.shape}")
-            
-            self.known_faces[name] = embedding
-            print(f"DEBUG: Added to known_faces dict, total faces: {len(self.known_faces)}")
-            
-            save_face(name, embedding, 0.95)
-            print(f"DEBUG: Called save_face for '{name}'")
-            
-            self.logger.info(f"Added face for user: {name}")
+            if embedding is None:
+                print(f"⚠️ Could not extract embedding for {name}/{angle}")
+                return False
+
+            if name not in self.known_faces:
+                self.known_faces[name] = []
+            self.known_faces[name].append(embedding)
+
+            save_face(name, embedding, angle)
+            print(f"✅ Face registered for {name} ({angle})")
             return True
         except Exception as e:
-            print(f"DEBUG: Exception in add_face: {e}")
-            self.logger.error(f"Failed to add face for {name}: {e}", exc_info=True)
+            self.logger.error(f"Failed to add face for {name}: {e}")
             return False
-    
+
     def load_known_faces(self) -> None:
-        """Load known faces from database"""
+        """Load all face embeddings from DB — supports multiple angles per person"""
         try:
-            faces = get_all_faces()
+            faces = get_all_faces()  # {name: [emb1, emb2, ...]}
             self.known_faces = {
-                html.unescape(name): embedding 
-                for name, embedding in faces.items()
+                name: [np.array(e, dtype=np.float32).flatten() for e in embeddings]
+                for name, embeddings in faces.items()
             }
-            print(f"INFO:face_recognizer:Loaded {len(self.known_faces)} known faces")
-            if self.known_faces:
-                print(f"Known faces: {list(self.known_faces.keys())}")
-            else:
-                print("WARNING: No faces found in database!")
-            self.logger.info(f"Loaded {len(self.known_faces)} known faces")
+            total = sum(len(v) for v in self.known_faces.values())
+            print(f"✅ Loaded {len(self.known_faces)} people ({total} embeddings): {list(self.known_faces.keys())}")
         except Exception as e:
-            print(f"ERROR loading faces: {e}")
-            self.logger.error(f"Failed to load known faces: {e}", exc_info=True)
+            self.logger.error(f"Failed to load known faces: {e}")
             self.known_faces = {}

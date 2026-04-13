@@ -3,139 +3,184 @@ import cv2
 import numpy as np
 import os
 
+# 80 COCO class names
+COCO_CLASSES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
+    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
+    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
+    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
+    "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+    "toothbrush"
+]
+
+
 class ObjectDetector:
     def __init__(self, confidence_threshold=0.5):
-        model_path = "models/model.onnx"
-        labels_path = "models/labels.txt"
-        
-        print(f"🔍 Loading ONNX model: {model_path}")
-        
-        if not os.path.exists(model_path):
-            print(f"❌ ONNX model not found: {model_path}")
-            raise FileNotFoundError(f"Model file not found: {model_path}")
-        
-        # Load ONNX model with Pi 4B optimization
-        session_options = ort.SessionOptions()
-        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        session_options.intra_op_num_threads = 4
-        
-        providers = ['CPUExecutionProvider']
-        self.session = ort.InferenceSession(model_path, session_options, providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_name = self.session.get_outputs()[0].name
-        
-        input_shape = self.session.get_inputs()[0].shape
-        self.input_height = input_shape[2] if len(input_shape) == 4 else 224
-        self.input_width = input_shape[3] if len(input_shape) == 4 else 224
         self.confidence_threshold = confidence_threshold
-        
-        self.class_names = self.load_labels(labels_path)
-        
-        print(f"✅ ONNX model loaded")
-        print(f"📊 Input size: {self.input_width}x{self.input_height}")
-        print(f"🏷️ Classes: {self.class_names}")
-    
-    def load_labels(self, labels_path):
-        """Load class labels"""
-        if os.path.exists(labels_path):
-            with open(labels_path, 'r') as f:
-                labels = [line.strip() for line in f.readlines()]
-            return labels
-        else:
-            # Default labels for your model
-            return ["0 bottle", "1 cup", "2 nothing"]
-    
-    def preprocess_image(self, image):
-        """Preprocess image for ONNX model - correct tensor order"""
-        # Resize to exact model input size (224x224)
-        resized = cv2.resize(image, (224, 224))
-        rgb_image = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        # Keep HWC format (224, 224, 3) instead of CHW
-        processed = np.expand_dims(rgb_image, axis=0)
-        return processed.astype(np.uint8)
-    
-    def detect(self, frame):
-        """Detect objects using ONNX model"""
+        self.session = None
+        self.input_name = None
+        self.input_size = (640, 640)
+        self._init_model()
+
+    def _init_model(self):
+        """Download YOLOv8n ONNX if not present, then load it"""
+        model_path = "models/yolov8n.onnx"
+
+        if not os.path.exists(model_path):
+            print("📥 YOLOv8n ONNX not found — downloading...")
+            self._download_model(model_path)
+
+        if not os.path.exists(model_path):
+            print("❌ YOLOv8n model unavailable")
+            return
+
         try:
-            input_data = self.preprocess_image(frame)
-            output_data = self.session.run([self.output_name], {self.input_name: input_data})[0]
-            predictions = output_data[0]
-            
-            top_index = np.argmax(predictions)
-            top_confidence = float(predictions[top_index])
-            top_class = self.class_names[top_index] if top_index < len(self.class_names) else f"Class_{top_index}"
-            
-            if top_confidence > self.confidence_threshold and "nothing" not in top_class.lower():
-                object_name = top_class.split(" ", 1)[-1] if " " in top_class else top_class
-                
-                return [{
-                    'name': object_name,
-                    'confidence': top_confidence,
-                    'bbox': [0, 0, frame.shape[1], frame.shape[0]],
-                    'area': frame.shape[0] * frame.shape[1]
-                }]
-            
-            return []
-            
+            opts = ort.SessionOptions()
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            opts.intra_op_num_threads = 4
+            self.session = ort.InferenceSession(
+                model_path, opts, providers=["CPUExecutionProvider"]
+            )
+            self.input_name = self.session.get_inputs()[0].name
+            print("✅ YOLOv8n ONNX loaded")
         except Exception as e:
-            print(f"ONNX detection error: {e}")
+            print(f"❌ Failed to load YOLOv8n: {e}")
+            self.session = None
+
+    def _download_model(self, path: str):
+        """Download YOLOv8n ONNX from ultralytics"""
+        try:
+            from ultralytics import YOLO
+            model = YOLO("yolov8n.pt")
+            model.export(format="onnx", imgsz=640, simplify=True)
+            exported = "yolov8n.onnx"
+            if os.path.exists(exported):
+                os.makedirs("models", exist_ok=True)
+                os.rename(exported, path)
+                print(f"✅ YOLOv8n exported to {path}")
+        except Exception as e:
+            print(f"❌ Model download/export failed: {e}")
+            print("   Run: pip install ultralytics  then restart")
+
+    def _preprocess(self, image: np.ndarray):
+        """Letterbox resize to 640x640, normalize to float32"""
+        h, w = image.shape[:2]
+        scale = min(self.input_size[0] / h, self.input_size[1] / w)
+        nh, nw = int(h * scale), int(w * scale)
+        resized = cv2.resize(image, (nw, nh))
+
+        # Pad to 640x640
+        canvas = np.full((self.input_size[0], self.input_size[1], 3), 114, dtype=np.uint8)
+        pad_y = (self.input_size[0] - nh) // 2
+        pad_x = (self.input_size[1] - nw) // 2
+        canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
+
+        # HWC → CHW, normalize
+        blob = canvas[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
+        return np.expand_dims(blob, 0), scale, pad_x, pad_y
+
+    def detect(self, frame: np.ndarray) -> list:
+        """Run YOLOv8n inference, return list of detection dicts"""
+        if self.session is None:
             return []
-    
-    def draw_detections(self, frame, detections):
-        """Draw detections on frame with proper visual feedback"""
-        if not detections:
-            return frame
-            
-        for detection in detections:
-            name = detection['name']
-            confidence = detection['confidence']
-            
-            # Choose color based on confidence
-            if confidence > 0.8:
-                color = (0, 255, 0)  # Green - high confidence
-            elif confidence > 0.6:
-                color = (0, 255, 255)  # Yellow - medium confidence
-            else:
-                color = (0, 165, 255)  # Orange - low confidence
-            
+        try:
             h, w = frame.shape[:2]
-            
-            # Draw thick colored border around entire frame
-            border_thickness = 8
-            cv2.rectangle(frame, (0, 0), (w, h), color, border_thickness)
-            
-            # Draw detection box in center (simulated object location)
-            center_x, center_y = w // 2, h // 2
-            box_size = 150
-            x1 = center_x - box_size // 2
-            y1 = center_y - box_size // 2
-            x2 = center_x + box_size // 2
-            y2 = center_y + box_size // 2
-            
-            # Draw detection box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-            
-            # Draw label with background
-            label = f"{name.upper()} {confidence:.1%}"
-            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
-            
-            # Label background
-            cv2.rectangle(frame, (x1, y1-35), (x1 + label_size[0] + 10, y1), color, -1)
-            
-            # Label text
-            cv2.putText(frame, label, (x1 + 5, y1 - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
-            
-            # Draw object icon in corner
-            if "bottle" in name.lower():
-                cv2.putText(frame, "BOTTLE", (w-120, 40), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            elif "cup" in name.lower():
-                cv2.putText(frame, "CUP", (w-80, 40), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            
-            # Add detection indicator
-            cv2.circle(frame, (30, 30), 15, color, -1)
-            cv2.putText(frame, "!", (25, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
-        
+            blob, scale, pad_x, pad_y = self._preprocess(frame)
+            outputs = self.session.run(None, {self.input_name: blob})[0]
+
+            # YOLOv8 output: [1, 84, 8400] → transpose to [8400, 84]
+            preds = outputs[0].T  # (8400, 84)
+
+            results = []
+            for pred in preds:
+                scores = pred[4:]
+                class_id = int(np.argmax(scores))
+                confidence = float(scores[class_id])
+
+                if confidence < self.confidence_threshold:
+                    continue
+
+                # cx, cy, w_box, h_box in 640-space
+                cx, cy, bw, bh = pred[:4]
+
+                # Remove padding and scale back to original image coords
+                x1 = int((cx - bw / 2 - pad_x) / scale)
+                y1 = int((cy - bh / 2 - pad_y) / scale)
+                x2 = int((cx + bw / 2 - pad_x) / scale)
+                y2 = int((cy + bh / 2 - pad_y) / scale)
+
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+
+                name = COCO_CLASSES[class_id] if class_id < len(COCO_CLASSES) else f"class_{class_id}"
+
+                results.append({
+                    "name": name,
+                    "confidence": confidence,
+                    "bbox": [x1, y1, x2, y2],
+                    "area": (x2 - x1) * (y2 - y1)
+                })
+
+            # NMS to remove overlapping boxes
+            return self._nms(results)
+
+        except Exception as e:
+            print(f"YOLO detection error: {e}")
+            return []
+
+    def _nms(self, detections: list, iou_threshold: float = 0.45) -> list:
+        """Simple NMS across all classes"""
+        if not detections:
+            return []
+
+        detections = sorted(detections, key=lambda d: d["confidence"], reverse=True)
+        kept = []
+
+        for det in detections:
+            dominated = False
+            for kept_det in kept:
+                if self._iou(det["bbox"], kept_det["bbox"]) > iou_threshold:
+                    dominated = True
+                    break
+            if not dominated:
+                kept.append(det)
+
+        return kept
+
+    def _iou(self, a: list, b: list) -> float:
+        """Intersection over Union"""
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        if inter == 0:
+            return 0.0
+        area_a = (ax2 - ax1) * (ay2 - ay1)
+        area_b = (bx2 - bx1) * (by2 - by1)
+        return inter / (area_a + area_b - inter)
+
+    def draw_detections(self, frame: np.ndarray, detections: list) -> np.ndarray:
+        """Draw bounding boxes and labels on frame"""
+        for det in detections:
+            x1, y1, x2, y2 = det["bbox"]
+            name = det["name"]
+            conf = det["confidence"]
+
+            color = (0, 255, 0) if conf > 0.7 else (0, 255, 255) if conf > 0.5 else (0, 165, 255)
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            label = f"{name} {conf:.0%}"
+            (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.rectangle(frame, (x1, y1 - lh - 6), (x1 + lw + 4, y1), color, -1)
+            cv2.putText(frame, label, (x1 + 2, y1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
+
         return frame

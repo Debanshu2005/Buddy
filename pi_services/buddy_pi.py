@@ -20,18 +20,18 @@ from typing import Optional
 from collections import defaultdict
 
 # Hardware modules only
-from config import Config
-from states import BuddyState, StateManager
-from face_detector import FaceDetector
-from face_recognizer import FaceRecognizer
-from stability_tracker import StabilityTracker
-from objrecog.obj import ObjectDetector
-from servo_controller import ServoController
-from motor_controller import MotorController
+from core.config import Config
+from core.states import BuddyState, StateManager
+from vision.face_detector import FaceDetector
+from vision.face_recognizer import FaceRecognizer
+from core.stability_tracker import StabilityTracker
+from vision.objrecog.obj import ObjectDetector
+from hardware.servo_controller import ServoController
+from hardware.motor_controller import MotorController
 
 # Speech imports - Whisper STT
 try:
-    from speech_to_text import listen  # 🔑 Whisper STT
+    from audio.speech_to_text import listen  # 🔑 Whisper STT
 except ImportError as e:
     print(f"❌ Failed to import STT: {e}")
     listen = None
@@ -154,7 +154,7 @@ class BuddyPi:
             print("📷 Starting CSI camera helper...")
             try:
                 self.csi_process = subprocess.Popen(
-                    ["/usr/bin/python3", "csi_camera_helper.py"],
+                    ["/usr/bin/python3", str(Path(__file__).resolve().parent / "hardware" / "csi_camera_helper.py")],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
                 )
