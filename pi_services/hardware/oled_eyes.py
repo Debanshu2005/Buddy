@@ -31,29 +31,45 @@ class EyeState(Enum):
 
 @dataclass
 class _Eye:
-    cx: int   = _CX
-    cy: int   = _CY
-    w: int    = 30
-    h: int    = 24
-    lid: float = 0.0
+    cx: int       = _CX
+    cy: int       = _CY
+    w: int        = 30
+    h: int        = 24
+    lid: float    = 0.0
     pupil_dx: int = 0
     pupil_dy: int = 0
+    # eyebrow: offset from top of eye, tilt (-=inner up, +=inner down)
+    brow_y: int   = -8   # gap above eye top
+    brow_tilt: int = 0   # inner end y offset (+ = angry/V, - = sad/^)
 
 
 def _draw_eye(draw: ImageDraw.ImageDraw, eye: _Eye):
     x0, y0 = eye.cx - eye.w, eye.cy - eye.h
     x1, y1 = eye.cx + eye.w, eye.cy + eye.h
 
+    # iris
     draw.ellipse([x0, y0, x1, y1], outline=_BLUE, fill=_BLUE)
 
+    # pupil
     pr = 9
     px, py = eye.cx + eye.pupil_dx, eye.cy + eye.pupil_dy
     draw.ellipse([px - pr, py - pr, px + pr, py + pr], fill="black")
 
+    # upper lid
     if eye.lid > 0:
         draw.rectangle([x0, y0, x1, y0 + int(eye.h * 2 * eye.lid)], fill="black")
+    # lower lid
     if eye.lid > 0:
         draw.rectangle([x0, y1 - int(eye.h * eye.lid), x1, y1], fill="black")
+
+    # eyebrow — thick line above the eye
+    # left end = outer (x0+4), right end = inner (x1-4)
+    # brow_tilt raises/lowers the inner end for expression
+    brow_base = y0 + eye.brow_y
+    bx0, by0 = x0 + 4,  brow_base
+    bx1, by1 = x1 - 4,  brow_base + eye.brow_tilt
+    for offset in range(3):   # 3px thick
+        draw.line([bx0, by0 + offset, bx1, by1 + offset], fill=_BLUE, width=2)
 
 
 def _render(device, eye: _Eye):
@@ -99,6 +115,8 @@ class OledEye:
 
             if state == EyeState.SLEEPING:
                 eye.lid = 0.95
+                eye.brow_y = -6
+                eye.brow_tilt = 4   # droopy
                 _render(self._device, eye)
                 time.sleep(0.1)
                 continue
@@ -106,6 +124,7 @@ class OledEye:
             if state == EyeState.WAKING:
                 for lid in [0.9, 0.7, 0.5, 0.3, 0.1, 0.0]:
                     eye.lid = lid
+                    eye.brow_y = -6 + int((1 - lid) * 4)
                     _render(self._device, eye)
                     time.sleep(0.07)
                 with self._lock:
@@ -114,8 +133,10 @@ class OledEye:
                 continue
 
             if state == EyeState.THINKING:
-                # squished eye + pupil sweeps left-right
+                # squished eye + pupil sweeps left-right + furrowed brow
                 eye.h = 10
+                eye.brow_y   = -6
+                eye.brow_tilt = 6   # inner end down = furrowed/V shape
                 sweep = int(12 * (time.time() % 1.0 - 0.5) * 2)
                 eye.pupil_dx = max(-10, min(10, sweep))
                 _render(self._device, eye)
@@ -124,19 +145,25 @@ class OledEye:
 
             if state == EyeState.LISTENING:
                 eye.w, eye.h = 33, 27
+                eye.brow_y   = -10  # raised brow
 
             if state == EyeState.HAPPY:
                 eye.lid = 0.35
                 eye.cy -= 4
+                eye.brow_y    = -12  # high raised
+                eye.brow_tilt = -3   # slight arch
 
             if state == EyeState.SURPRISED:
-                eye.w, eye.h = 36, 30
+                eye.w, eye.h  = 36, 30
+                eye.brow_y    = -14  # very high
+                eye.brow_tilt = -4
 
             if state == EyeState.SPEAKING:
                 bob += bob_dir
                 if abs(bob) >= 3:
                     bob_dir *= -1
                 eye.cy += bob
+                eye.brow_y = -9
 
             # --- blink ---
             blink_timer += 0.05

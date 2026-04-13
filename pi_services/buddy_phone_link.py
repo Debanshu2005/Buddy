@@ -40,8 +40,9 @@ from opencv_face_detector import FaceDetector
 from local_face_recognizer import FaceRecognizer
 from stability_tracker import StabilityTracker
 from objrecog.obj import ObjectDetector
-# from servo_controller import ServoController
+from servo_controller import ServoController
 from motor_controller import MotorController
+from hardware.oled_eyes import OledEyes, EyeState
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
 import edge_tts
@@ -453,15 +454,23 @@ class BuddyPi:
         print("✅ Object detection ready")
 
         # ── Servo ─────────────────────────────────────────────────────────────
-        # try:
-        #     self.servo             = ServoController()
-        #     self.servo_enabled     = True
-        #     self._servo_looking_up = False
-        # except Exception as e:
-        #     print(f"⚠️ Servo init failed: {e}")
-        self.servo             = None
-        self.servo_enabled     = False
-        self._servo_looking_up = False
+        try:
+            self.servo             = ServoController()
+            self.servo_enabled     = True
+            self._servo_looking_up = False
+        except Exception as e:
+            print(f"⚠️ Servo init failed: {e}")
+            self.servo             = None
+            self.servo_enabled     = False
+            self._servo_looking_up = False
+
+        # ── OLED Eyes ─────────────────────────────────────────────────────────
+        self.eyes: OledEyes | None = None
+        try:
+            self.eyes = OledEyes()
+            print("✅ OLED eyes ready")
+        except Exception as e:
+            print(f"⚠️ OLED eyes unavailable: {e}")
 
         # ── Motors ────────────────────────────────────────────────────────────
         self.motors = MotorController(port=ARDUINO_PORT, baud=ARDUINO_BAUD)
@@ -625,11 +634,16 @@ class BuddyPi:
 
     # ── TTS ──────────────────────────────────────────────────────────────────
 
+    def _eye(self, state: EyeState):
+        if self.eyes:
+            self.eyes.set_state(state)
+
     def speak(self, text: str):
         """Non-blocking TTS. Spawns a daemon thread with its own event loop."""
         if not self.speech_enabled or not text:
             return
-        self.is_speaking = True  # set before thread starts to avoid race
+        self.is_speaking = True
+        self._eye(EyeState.SPEAKING)
 
         def _speak():
             try:
@@ -643,6 +657,7 @@ class BuddyPi:
                 print(f"TTS Error: {e}")
             finally:
                 self.is_speaking = False
+                self._eye(EyeState.IDLE)
 
         threading.Thread(target=_speak, daemon=True).start()
 
@@ -704,6 +719,8 @@ class BuddyPi:
         import uuid
         token = str(uuid.uuid4())
         self._thinking_token = token
+        self._eye(EyeState.THINKING)
+        self.motors.emotion_move("thinking")
 
         def _delayed(t):
             time.sleep(1.5)
@@ -745,7 +762,9 @@ class BuddyPi:
                 continue
             print("✅ Wake word detected")
             self._play_listen_beep()
+            self._eye(EyeState.LISTENING)
             user_text = self.listen_for_speech()
+            self._eye(EyeState.IDLE)
             if user_text:
                 self._process_input(user_text)
             self._wait_for_tts()
@@ -1061,13 +1080,13 @@ class BuddyPi:
             frame, faces, name, confidence, self.current_detections
         )
 
-        # if self.servo_enabled and self.servo:
-        #     if face_detected and self._servo_looking_up:
-        #         self.servo.look_center(smooth=True)
-        #         self._servo_looking_up = False
-        #     elif not face_detected and not self._servo_looking_up:
-        #         self.servo.look_up(smooth=True)
-        #         self._servo_looking_up = True
+        if self.servo_enabled and self.servo:
+            if face_detected and self._servo_looking_up:
+                self.servo.look_center(smooth=True)
+                self._servo_looking_up = False
+            elif not face_detected and not self._servo_looking_up:
+                self.servo.look_up(smooth=True)
+                self._servo_looking_up = True
 
         return processed, face_detected, name, confidence
 
@@ -1126,10 +1145,12 @@ class BuddyPi:
     def _enter_sleep_mode(self):
         print("\n😴 Entering sleep mode...")
         self.sleep_mode = True
+        self._eye(EyeState.SLEEPING)
 
     def _wake_up_and_restart(self):
         print("😊 Waking up!")
         self.sleep_mode = False
+        self._eye(EyeState.WAKING)
         self._init_speech()
         self.speak("I'm awake! Say buddy to talk to me.")
 
@@ -1321,13 +1342,19 @@ class BuddyPi:
     def cleanup(self):
         self.running = False
 
-        # if self.servo_enabled and self.servo:
-        #     try:
-        #         self.servo.look_center(smooth=False)
-        #         time.sleep(0.3)
-        #         self.servo.cleanup()
-        #     except Exception:
-        #         pass
+        if self.eyes:
+            try:
+                self.eyes.stop()
+            except Exception:
+                pass
+
+        if self.servo_enabled and self.servo:
+            try:
+                self.servo.look_center(smooth=False)
+                time.sleep(0.3)
+                self.servo.cleanup()
+            except Exception:
+                pass
 
         if hasattr(self, 'motors'):
             try:
