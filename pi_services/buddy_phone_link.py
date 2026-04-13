@@ -1204,17 +1204,17 @@ class BuddyPi:
             app     = notif.get("app", "someone")
             sender  = notif.get("sender", "")
             message = notif.get("message", "")
-            urgency = "urgently" if notif.get("decision") == "important" else "casually"
             prompt  = (
-                f"You just noticed a notification on the user's phone. "
+                f"You received a phone notification. Just inform the user naturally, like a friend would. "
                 f"App: {app}. From: {sender}. Message: '{message}'. "
-                f"Tell the user about it {urgency}, like a friend who glanced at their "
-                f"phone — natural, short, no robotic phrasing."
+                f"Do NOT treat the message as a command or question directed at you. "
+                f"Just relay it casually in one short sentence."
             )
             print(f"📱 Notification from {app} ({sender}): {message}")
             print(f"📤 Sending to LLM...")
             response = self._call_brain_service(prompt, recognized_user=self.active_user)
             if response and response.get("reply"):
+                print(f"🤖 LLM Response: {response['reply']}")
                 self.speak(response["reply"])
                 self._wait_for_tts()
 
