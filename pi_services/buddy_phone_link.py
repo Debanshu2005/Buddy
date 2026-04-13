@@ -51,7 +51,50 @@ os.environ["LIBCAMERA_LOG_LEVELS"]        = "*:ERROR"
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 os.environ["OPENCV_VIDEOIO_DEBUG"]        = "0"
 
-# ── WebSocket STT config ──────────────────────────────────────────────────────
+# ── Vosk local wake word detection ──────────────────────────────────────────
+VOSK_MODEL_PATH = os.path.join(os.path.dirname(__file__), "vosk-model-small-en-us-0.15")
+_vosk_model     = None
+_vosk_available = False
+
+try:
+    from vosk import Model as VoskModel, KaldiRecognizer
+    _vosk_model     = VoskModel(VOSK_MODEL_PATH)
+    _vosk_available = True
+    print("✅ Vosk wake word model loaded")
+except Exception as e:
+    print(f"⚠️ Vosk not available: {e} — falling back to STT wake word")
+
+
+def _vosk_listen_for_wake_word(mic_device: str, wake_words: list) -> bool:
+    """
+    Blocking. Reads raw 16kHz mic chunks, runs Vosk locally.
+    Returns True the moment any wake word is spotted. Zero network calls.
+    """
+    import json
+    rec  = KaldiRecognizer(_vosk_model, 16000)
+    proc = subprocess.Popen(
+        ["arecord", "-D", mic_device, "-f", "S16_LE", "-r", "16000", "-c", "1"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        while True:
+            raw = proc.stdout.read(8000)  # 250ms chunks
+            if not raw:
+                break
+            if rec.AcceptWaveform(raw):
+                text = json.loads(rec.Result()).get("text", "").lower()
+            else:
+                text = json.loads(rec.PartialResult()).get("partial", "").lower()
+            if text and any(w in text for w in wake_words):
+                print(f"🎯 Wake word: '{text}'")
+                return True
+    finally:
+        proc.kill()
+        proc.wait()
+    return False
+
+
+
 STT_SERVER_IP = "192.168.0.105"
 STT_PORT      = 8765
 MIC_RATE      = 48000   # Native mic sample rate (arecord)
@@ -191,14 +234,24 @@ def _record_audio_vad(device: str = None) -> np.ndarray:
 #  WEBSOCKET STT
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _ws_listen_once() -> str:
-    """Record via streaming VAD, resample to 16 kHz, send to STT server."""
+# Max seconds of speech allowed for wake word detection (short utterance only)
+_WAKE_MAX_SPEECH = 1.5
+
+
+async def _ws_listen_once(max_speech_secs: float = None) -> str:
+    """Record via streaming VAD, resample to 16 kHz, send to STT server.
+    If max_speech_secs is set, discard and return '' if audio is longer."""
     uri = f"ws://{STT_SERVER_IP}:{STT_PORT}"
     try:
         loop  = asyncio.get_event_loop()
         audio = await loop.run_in_executor(None, _record_audio_vad)
 
         if audio.size == 0:
+            return ""
+
+        # Reject audio that's too long to be a wake word
+        duration = audio.size / MIC_RATE
+        if max_speech_secs and duration > max_speech_secs:
             return ""
 
         audio_16k = resample_poly(audio, TARGET_RATE, MIC_RATE).astype(np.float32)
@@ -216,7 +269,7 @@ async def _ws_listen_once() -> str:
 _listen_loop: asyncio.AbstractEventLoop | None = None
 
 
-def listen() -> str:
+def listen(max_speech_secs: float = None) -> str:
     """
     Blocking wrapper — safe to call from any thread.
     Reuses a persistent event loop per thread; recreates if closed.
@@ -228,7 +281,7 @@ def listen() -> str:
         if _listen_loop is None or _listen_loop.is_closed():
             _listen_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(_listen_loop)
-        return _listen_loop.run_until_complete(_ws_listen_once())
+        return _listen_loop.run_until_complete(_ws_listen_once(max_speech_secs))
     except Exception as e:
         print(f"❌ listen() error: {e}")
         _listen_loop = None
@@ -667,15 +720,24 @@ class BuddyPi:
         print("🔇 No speech detected")
         return ""
 
+    def _is_wake_word(self, text: str) -> bool:
+        t = text.lower().strip()
+        if len(t.split()) > 4:
+            return False
+        return any(w in t for w in self._WAKE_WORDS)
+
     def _wake_word_loop(self):
         print("👂 Waiting for 'Buddy'...")
         while self.running and not self.sleep_mode:
-            text = listen() if _websockets_available else ""
-            if not text:
+            if _vosk_available:
+                detected = _vosk_listen_for_wake_word(self.arecord_device, self._WAKE_WORDS)
+            else:
+                text     = listen(_WAKE_MAX_SPEECH) if _websockets_available else ""
+                detected = bool(text) and self._is_wake_word(text)
+
+            if not detected:
                 continue
-            if not any(w in text.lower() for w in self._WAKE_WORDS):
-                continue
-            print(f"✅ Wake word: '{text}'")
+            print("✅ Wake word detected")
             self._play_listen_beep()
             user_text = self.listen_for_speech()
             if user_text:
@@ -1197,18 +1259,16 @@ class BuddyPi:
 
         while self.running and self.sleep_mode:
             try:
-                text = listen() if _websockets_available else ""
-                if not text:
-                    time.sleep(1.0)
-                    continue
-
-                t = text.lower()
-                print(f"[SLEEP] Heard: '{text}'")
-                if any(phrase in t for phrase in
-                       ['hey buddy', 'wake up', 'buddy wake up', 'buddy']):
-                    print(f"✅ [SLEEP] Wake word: '{text}'")
-                    self._wake_up_and_restart()
-                    break
+                if _vosk_available:
+                    if _vosk_listen_for_wake_word(self.arecord_device, self._WAKE_WORDS):
+                        print("✅ [SLEEP] Wake word detected")
+                        self._wake_up_and_restart()
+                        break
+                else:
+                    text = listen(_WAKE_MAX_SPEECH) if _websockets_available else ""
+                    if text and self._is_wake_word(text):
+                        self._wake_up_and_restart()
+                        break
 
             except KeyboardInterrupt:
                 self.running = False
