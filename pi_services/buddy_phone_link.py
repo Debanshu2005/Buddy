@@ -1127,7 +1127,11 @@ class BuddyPi:
     def _start_phone_listener(self):
         import json
         from http.server import BaseHTTPRequestHandler, HTTPServer
+        from socketserver import ThreadingMixIn
         buddy = self
+
+        class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+            daemon_threads = True
 
         class _Handler(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -1171,7 +1175,7 @@ class BuddyPi:
                 pass
 
         def _run():
-            HTTPServer(('0.0.0.0', 8001), _Handler).serve_forever()
+            _ThreadedHTTPServer(('0.0.0.0', 8001), _Handler).serve_forever()
 
         threading.Thread(target=_run, daemon=True).start()
         print('📱 Phone notification listener started on port 8001')
