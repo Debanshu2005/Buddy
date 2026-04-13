@@ -63,11 +63,10 @@ VAD_SPEECH_THRESH  = 0.008 # RMS above this = speech. Raise if noise triggers it
 VAD_SILENCE_THRESH = 0.003 # RMS below this = silence. Lower if speech gets cut early.
 VAD_MAX_DURATION   = 8.0   # Hard cap — stops recording after this many seconds
 VAD_MIN_SPEECH     = 0.4   # Minimum seconds of detected speech before accepting
-VAD_SILENCE_AFTER  = 0.6   # Seconds of silence after speech before cutting off
+VAD_SILENCE_AFTER  = 0.3   # Seconds of silence after speech before cutting off
 _VAD_CHUNK_SECS    = 0.1   # Size of each recorded chunk (100 ms)
 
 # ── Wake word / conversation config ──────────────────────────────────────────
-_CONVO_TURNS = 2   # Follow-up turns allowed without repeating the wake word
 
 try:
     import websockets as _websockets_lib
@@ -79,7 +78,6 @@ except ImportError as e:
 # ── Module-level mic globals (set at runtime by BuddyPi.__init__) ─────────────
 _mic_card_index:      str        = "3"
 _mic_device:          str        = "plughw:3,0"
-_spk_device:          str        = "plughw:0,0"
 _working_arecord_dev: str | None = None   # cached after first successful probe
 
 
@@ -530,27 +528,39 @@ class BuddyPi:
 
     # ── Alexa-style beep ─────────────────────────────────────────────────────
 
+    def _generate_beep_wav(self):
+        """Generate beep WAV once and cache it at /tmp/buddy_beep.wav."""
+        import wave, struct
+        wav_path = "/tmp/buddy_beep.wav"
+        if os.path.exists(wav_path):
+            return wav_path
+        sample_rate = 22050
+        frames = []
+        for freq, dur in ((880, 0.12), (1100, 0.15)):
+            n = int(sample_rate * dur)
+            for i in range(n):
+                val = int(14000 * np.sin(2 * np.pi * freq * i / sample_rate))
+                frames.append(struct.pack('<h', val))
+        with wave.open(wav_path, 'w') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(b''.join(frames))
+        return wav_path
+
     def _play_listen_beep(self):
-        """Two-tone rising chime written directly to a WAV and played via aplay."""
+        """Two-tone rising chime via aplay. Tries multiple devices until one works."""
         try:
-            import wave, struct
-            sample_rate = 22050
-            wav_path    = "/tmp/buddy_beep.wav"
-            frames      = []
-            for freq, dur in ((880, 0.12), (1100, 0.15)):
-                n = int(sample_rate * dur)
-                for i in range(n):
-                    val = int(14000 * np.sin(2 * np.pi * freq * i / sample_rate))
-                    frames.append(struct.pack('<h', val))
-            with wave.open(wav_path, 'w') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(sample_rate)
-                wf.writeframes(b''.join(frames))
-            subprocess.Popen(
-                ["aplay", "-D", self.aplay_device, "-q", wav_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            ).wait()
+            wav_path = self._generate_beep_wav()
+            devices  = [self.aplay_device, "plughw:0,0", "default"]
+            for dev in devices:
+                r = subprocess.run(
+                    ["aplay", "-D", dev, "-q", wav_path],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                if r.returncode == 0:
+                    return
+            print("⚠️ Beep: no working audio device found")
         except Exception as e:
             print(f"⚠️ Beep failed: {e}")
 
@@ -560,9 +570,9 @@ class BuddyPi:
         """Non-blocking TTS. Spawns a daemon thread with its own event loop."""
         if not self.speech_enabled or not text:
             return
+        self.is_speaking = True  # set before thread starts to avoid race
 
         def _speak():
-            self.is_speaking = True
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -657,53 +667,25 @@ class BuddyPi:
         print("🔇 No speech detected")
         return ""
 
-    # ── Alexa-style wake-word loop ────────────────────────────────────────────
-
-    def _strip_wake_word(self, text: str) -> str:
-        """Remove the wake word from the start of the transcript, return remainder."""
-        t = text.lower().strip()
-        for w in sorted(self._WAKE_WORDS, key=len, reverse=True):  # longest first
-            if t.startswith(w):
-                return text[len(w):].strip().strip(",. ")
-        return text
-
     def _wake_word_loop(self):
-        """
-        Idle loop — streams audio continuously via VAD.
-        - "Hey Buddy what time is it" → strips wake word → sends to LLM directly
-        - "Hey Buddy" (alone)         → beep → listen once → send to LLM
-        - After answering, always returns to idle (wake word required again)
-        """
-        print("👂 Idle — waiting for 'Hey Buddy'...")
+        print("👂 Waiting for 'Buddy'...")
         while self.running and not self.sleep_mode:
             text = listen() if _websockets_available else ""
             if not text:
                 continue
-
-            t = text.lower()
-            print(f"[IDLE] Heard: '{text}'")
-
-            if not any(w in t for w in self._WAKE_WORDS):
+            if not any(w in text.lower() for w in self._WAKE_WORDS):
                 continue
-
-            print("✅ Wake word detected")
-            remainder = self._strip_wake_word(text)
-
-            if remainder:
-                # Query came in the same utterance — process immediately
-                print(f"[INLINE] Query: '{remainder}'")
-                self._play_listen_beep()
-                self._process_input(remainder)
-                self._wait_for_tts()
-            else:
-                # Just the wake word — beep and listen for the query
-                self._play_listen_beep()
-                user_text = self.listen_for_speech()
-                if user_text:
-                    self._process_input(user_text)
-                    self._wait_for_tts()
-
-            print("👂 Back to wake-word listening...")
+            print(f"✅ Wake word: '{text}'")
+            self._play_listen_beep()
+            user_text = self.listen_for_speech()
+            if user_text:
+                self._process_input(user_text)
+            self._wait_for_tts()
+            with self._notif_lock:
+                has_notifs = bool(self._notif_queue)
+            if has_notifs:
+                threading.Thread(target=self._flush_notifications, daemon=True).start()
+            print("👂 Back to idle...")
 
     # ── Brain service ─────────────────────────────────────────────────────────
 
@@ -889,16 +871,10 @@ class BuddyPi:
         self.speak(reply)
 
         emotion = response.get("emotion", "")
-        print(f"🎭 Emotion: '{emotion}'")
-        if emotion and self.motors.is_connected():
-            threading.Timer(0.3, lambda e=emotion: self.motors.emotion_move(e)).start()
-
-        self._wait_for_tts()
-
-        with self._notif_lock:
-            has_notifs = bool(self._notif_queue)
-        if has_notifs:
-            threading.Thread(target=self._flush_notifications, daemon=True).start()
+        if emotion:
+            print(f"🎭 Emotion: '{emotion}'")
+            if self.motors.is_connected():
+                threading.Timer(0.3, lambda e=emotion: self.motors.emotion_move(e)).start()
 
     # ── Motor control ─────────────────────────────────────────────────────────
 
@@ -954,14 +930,7 @@ class BuddyPi:
             return None
 
     def _greet_recognized_user(self, name: str):
-        try:
-            response = self._call_brain_service(
-                f"You just recognised {name}. Greet them warmly by name.",
-                recognized_user=name
-            )
-            self._display_response(response)
-        except Exception as e:
-            print(f"Greeting error: {e}")
+        self.speak(f"Hey {name}, good to see you!")
 
     # ── Frame processing ──────────────────────────────────────────────────────
 
@@ -1073,54 +1042,8 @@ class BuddyPi:
     # ── Startup greeting ──────────────────────────────────────────────────────
 
     def _startup_greeting(self):
-        """Runs in a background thread — does NOT block the camera loop."""
-        try:
-            print("Starting face recognition for greeting...")
-            time.sleep(1.0)
-            attempts = {}
-
-            for _ in range(50):
-                ret, frame = self._read_frame()
-                if not ret:
-                    time.sleep(0.1)
-                    continue
-
-                faces = self.detector.detect(frame)
-                if faces:
-                    largest   = self.detector.get_largest_face(faces)
-                    is_stable = self.stability.update(largest)
-                    x, y, w, h = largest
-
-                    if w > 80 and h > 80 and is_stable:
-                        name, conf = self.face_recognizer.recognize(
-                            frame[y:y+h, x:x+w]
-                        )
-                        if name != "Unknown" and conf > self.recognition_threshold:
-                            attempts[name] = attempts.get(name, 0) + 1
-                            if attempts[name] >= 3:
-                                self.active_user = name
-                                print(f"✅ Startup recognised: {name}")
-                                response = self._call_brain_service(
-                                    "Hello! Nice to see you!", recognized_user=name
-                                )
-                                self._display_response(response)
-                                return
-
-                        if sum(attempts.values()) >= self.max_attempts:
-                            response = self._call_brain_service(
-                                "I can see someone but don't recognise them. "
-                                "Greet them politely and ask their name."
-                            )
-                            self._display_response(response)
-                            return
-                time.sleep(0.1)
-
-            response = self._call_brain_service("Hello! I'm ready to chat!")
-            self._display_response(response)
-
-        except Exception as e:
-            self.logger.error(f"Startup greeting error: {e}")
-            self.speak("Hello! I'm ready to chat!")
+        time.sleep(1.0)
+        self.speak("Hey! I'm Buddy. Call me anytime.")
 
     # ── Sleep / wake ──────────────────────────────────────────────────────────
 
@@ -1132,18 +1055,7 @@ class BuddyPi:
         print("😊 Waking up!")
         self.sleep_mode = False
         self._init_speech()
-        self.speak("I'm awake! Let me see who's here.")
-        time.sleep(1)
-
-        recognized = self._force_face_recognition()
-        if recognized:
-            self.active_user = recognized
-            response = self._call_brain_service(
-                "I just woke up. Greet them warmly.", recognized_user=recognized
-            )
-        else:
-            response = self._call_brain_service("I just woke up. Say hello.")
-        self._display_response(response)
+        self.speak("I'm awake! Say buddy to talk to me.")
 
     # ── Phone notifications ───────────────────────────────────────────────────
 
