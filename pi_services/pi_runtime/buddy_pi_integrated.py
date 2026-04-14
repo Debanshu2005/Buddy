@@ -622,37 +622,116 @@ class BuddyIntegratedPi:
             self._eye(EyeState.SLEEPING)
             return
 
-        # 4. Name introduction after face scan
-        if (self.awaiting_name or self._pending_face_scan) and any(p in lowered for p in ("my name is", "i am", "i'm", "call me", "name is")):
+        # 4. Register face
+        if any(p in lowered for p in ("register my face", "register face", "add my face", "save my face")):
+            self.speak("Sure! What's your name?")
+            self._wait_for_tts()
+            self.awaiting_name = True
+            return
+
+        # 5. Name reply after registration trigger
+        if self.awaiting_name and any(p in lowered for p in ("my name is", "i am", "i'm", "call me", "name is")):
             name = self._extract_name(text)
             if name:
-                self.active_user = name
                 self.awaiting_name = False
-                if self._pending_face_scan:
-                    self._pending_face_scan = False
-                    # rename __pending__ embeddings to real name
-                    try:
-                        self.recognizer.rename_person("__pending__", name)
-                    except Exception:
-                        pass
-                    print(f"Registered: {name}")
-                    reply = self._call_brain(
-                        f"You just registered {name}'s face. Greet them warmly and say you'll remember them.",
-                        recognized_user=name,
-                    )
-                else:
-                    reply = self._call_brain(
-                        f"The user said their name is {name}. Greet them.",
-                        recognized_user=name,
-                    )
-                self._display_response(reply)
+                self.active_user = name
+                self.speak(f"Nice to meet you {name}! I'll scan your face from different angles. Please look straight at me and hold still.")
+                self._wait_for_tts()
+                threading.Thread(target=self._do_scan_then_save, args=(name,), daemon=True).start()
                 return
 
-        # 5. Brain
+        # 6. Identity check — single scan
+        identity_triggers = ("do you know me", "who am i", "do you recognize me", "recognize me", "identify me", "can you see me")
+        if any(p in lowered for p in identity_triggers):
+            self._check_and_greet_face()
+            return
+
+        # 7. Brain
         self._play_thinking_sound()
         response = self._call_brain(text, self.active_user)
         self._thinking_token = None
         self._display_response(response)
+
+    def _check_and_greet_face(self):
+        """Single face scan — greet if known, say unknown if not."""
+        if not self.local_vision_enabled or self.detector is None or self.recognizer is None:
+            self.speak("I can't see right now.")
+            return
+        print("[Face check] Reading frame...")
+        ok, frame = self._read_frame()
+        if not ok or frame is None:
+            frame = self.last_frame
+        if frame is None:
+            print("[Face check] No frame available")
+            self.speak("I can't see right now.")
+            return
+        print("[Face check] Detecting faces...")
+        faces = self.detector.detect(frame)
+        if not faces:
+            print("[Face check] No faces found")
+            self.speak("I don't see anyone in front of me.")
+            return
+        print(f"[Face check] {len(faces)} face(s) found, running recognition...")
+        x, y, w, h = self.detector.get_largest_face(faces)
+        face_roi = frame[y:y + h, x:x + w]
+        name, confidence = self.recognizer.recognize(face_roi)
+        print(f"[Face check] Result: {name} (confidence: {confidence:.2f})")
+        if name != "Unknown" and confidence > 0.45:
+            self.active_user = name
+            print(f"[Face check] Match found: {name}")
+            self.speak(f"Hi {name}! Good to see you.")
+        else:
+            print(f"[Face check] No match (best confidence: {confidence:.2f})")
+            self.speak("I don't recognize you. Say 'register my face' if you'd like me to remember you.")
+
+    def _do_scan_then_save(self, name: str):
+        """Multi-angle face scan then save under name."""
+        poses = [
+            ("front", "Great! Now slowly turn your face to the LEFT and hold it there."),
+            ("left",  "Perfect! Now turn your face to the RIGHT and hold it there."),
+            ("right", "Good! Now tilt your face slightly UP and hold it there."),
+            ("up",    "Almost done! Now tilt your face slightly DOWN and hold it there."),
+            ("down",  None),
+        ]
+        total_angles = len(poses)
+        for i, (angle, next_instruction) in enumerate(poses):
+            print(f"[Registration] Angle {i+1}/{total_angles}: {angle.upper()} — waiting 5s...")
+            time.sleep(5.0)
+            print(f"[Registration] Capturing {angle} angle for {name}...")
+            captured = False
+            for attempt in range(30):
+                if self.last_frame is None:
+                    time.sleep(0.1)
+                    continue
+                faces = self.detector.detect(self.last_frame)
+                if not faces:
+                    if attempt % 5 == 0:
+                        print(f"[Registration] No face detected, retrying... ({attempt+1}/30)")
+                    time.sleep(0.1)
+                    continue
+                x, y, w, h = self.detector.get_largest_face(faces)
+                if w <= 80 or h <= 80:
+                    print(f"[Registration] Face too small ({w}x{h}), retrying...")
+                    time.sleep(0.1)
+                    continue
+                face_roi = self.last_frame[y:y + h, x:x + w]
+                if self.recognizer.add_face(name, face_roi, angle):
+                    print(f"[Registration] ✅ Captured {angle} angle for {name}")
+                    captured = True
+                    break
+                time.sleep(0.1)
+            if not captured:
+                print(f"[Registration] ⚠️ Could not capture {angle} angle for {name}")
+                self.logger.warning("Could not capture %s angle for %s", angle, name)
+            if next_instruction:
+                self.speak(next_instruction)
+                self._wait_for_tts()
+
+        print(f"[Registration] All angles done for {name}. Saving to DB...")
+        total = len(self.recognizer.known_faces.get(name, []))
+        print(f"[Registration] ✅ {name} saved with {total} embeddings in DB")
+        self.speak(f"Done! I've saved your face {name}. I'll recognize you next time.")
+        self._wait_for_tts()
 
     def _is_stop_command(self, text: str) -> bool:
         return any(word in text for word in self._STOP_WORDS)
@@ -717,36 +796,10 @@ class BuddyIntegratedPi:
                     print("Detected face")
                     self._last_logged_face_present = True
                 largest = self.detector.get_largest_face(self.last_faces)
-                is_stable = self.stability.update(largest)
-                x, y, w, h = largest
-                if is_stable and w > 80 and h > 80:
-                    now = time.time()
-                    if now - self.last_recognition_time > self.settings.recognition_interval:
-                        face_roi = frame[y:y + h, x:x + w]
-                        name, confidence = self.recognizer.recognize(face_roi)
-                        self.last_recognition_time = now
-                        if name != "Unknown" and confidence > 0.45:
-                            if self._last_logged_recognized_name != name:
-                                print(f"Recognized: {name}")
-                                self._last_logged_recognized_name = name
-                            if self.active_user != name:
-                                self.active_user = name
-                                self.awaiting_name = False
-                                reply = self._call_brain(
-                                    f"You just recognized {name}. Greet them warmly by name.",
-                                    recognized_user=name,
-                                )
-                                self._display_response(reply)
-                        elif not self.awaiting_name and not self.is_speaking:
-                            self.awaiting_name = True
-                            reply = self._call_brain(
-                                "You see someone but don't recognize them. Say hi and ask for their name.",
-                                recognized_user=None,
-                            )
-                            self._display_response(reply)
+                self.stability.update(largest)
             else:
-                self._last_logged_face_present = False
-                self._last_logged_recognized_name = None
+                if self._last_logged_face_present is not False:
+                    self._last_logged_face_present = False
                 self.stability.reset()
 
         return self._draw_visualization(frame.copy())
@@ -991,13 +1044,6 @@ class BuddyIntegratedPi:
             print("Wake word detected")
             time.sleep(0.3)
             self._play_listen_beep()
-
-            # --- face check ---
-            if self.local_vision_enabled and self.detector is not None:
-                self._handle_wake_face()
-                # if a scan was just started, _pending_face_scan=True
-                # we still listen so user can say their name right after
-
             self._eye(EyeState.LISTENING)
             user_text = self.listen_for_speech()
             self._eye(EyeState.IDLE)
@@ -1095,7 +1141,7 @@ class BuddyIntegratedPi:
         # now wait for user to say their name via wake word → _process_input
         self._pending_face_scan = True
 
-    def _sleep_loop(self):
+
         print("Entering sleep mode...")
         self.speak("Going to sleep. Say hey buddy to wake me up.")
         self._wait_for_tts()
