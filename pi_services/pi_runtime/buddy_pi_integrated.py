@@ -54,6 +54,17 @@ os.environ["LIBCAMERA_LOG_LEVELS"] = "*:ERROR"
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
 
+_VOSK_MODEL_PATH = str(ROOT_DIR / "vosk-model-small-en-us-0.15")
+_vosk_model = None
+_vosk_available = False
+try:
+    from vosk import Model as VoskModel, KaldiRecognizer as _KaldiRecognizer
+    _vosk_model = VoskModel(_VOSK_MODEL_PATH)
+    _vosk_available = True
+    print("Vosk wake word model loaded")
+except Exception as _e:
+    print(f"Vosk not available: {_e} — falling back to STT wake word")
+
 
 @dataclass
 class RuntimeSettings:
@@ -687,10 +698,9 @@ class BuddyIntegratedPi:
         if not response:
             return
         reply = response.get("reply", "")
-        raw = response.get("raw_response", "")
         intent = response.get("intent", "conversation")
         emotion = response.get("emotion", "")
-        print(f"\nBuddy: {raw if raw else reply}")
+        print(f"\nBuddy: {reply}")
         if intent != "conversation":
             print(f"[INTENT: {intent}]")
         _brain_move = {
@@ -940,29 +950,52 @@ class BuddyIntegratedPi:
 
             time.sleep(0.02)
 
+    def _vosk_listen_for_wake_word(self) -> bool:
+        if not _vosk_available:
+            return False
+        rec = _KaldiRecognizer(_vosk_model, 16000)
+        proc = subprocess.Popen(
+            ["arecord", "-D", self.arecord_device, "-f", "S16_LE", "-r", "16000", "-c", "1"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            while self.running:
+                raw = proc.stdout.read(8000)
+                if not raw:
+                    break
+                if self.is_speaking:
+                    rec.Reset()
+                    continue
+                if rec.AcceptWaveform(raw):
+                    text = json.loads(rec.Result()).get("text", "").lower()
+                else:
+                    text = json.loads(rec.PartialResult()).get("partial", "").lower()
+                if text and any(w in text for w in self._WAKE_WORDS):
+                    print(f"Wake word: '{text}'")
+                    return True
+        finally:
+            proc.kill()
+            proc.wait()
+        return False
+
     def _startup_greeting(self):
         time.sleep(1.0)
         self.speak("Hey. I am Buddy. Call me anytime.")
 
     def _wake_loop(self):
-        while self.running:
-            if self.sleep_mode:
+        print("Waiting for 'Buddy'...")
+        while self.running and not self.sleep_mode:
+            if _vosk_available:
+                detected = self._vosk_listen_for_wake_word()
+            else:
                 text = self.listen_for_speech()
-                if text and any(word in text.lower() for word in self._WAKE_WORDS):
-                    self.sleep_mode = False
-                    self._eye(EyeState.WAKING)
-                    self.speak("I am awake. What can I do for you?")
-                    self._wait_for_tts()
+                detected = bool(text) and any(w in text.lower() for w in self._WAKE_WORDS)
+
+            if not detected:
                 continue
 
-            text = self.listen_for_speech()
-            if not text:
-                continue
-
-            lowered = text.lower()
-            if not any(word in lowered for word in self._WAKE_WORDS):
-                continue
-
+            print("Wake word detected")
             self._play_listen_beep()
             self._eye(EyeState.LISTENING)
             user_text = self.listen_for_speech()
@@ -972,9 +1005,42 @@ class BuddyIntegratedPi:
                 self._wait_for_tts()
 
             with self._notif_lock:
-                pending_notifications = bool(self._notif_queue)
-            if pending_notifications:
+                pending = bool(self._notif_queue)
+            if pending:
                 threading.Thread(target=self._flush_notifications, daemon=True).start()
+            print("Waiting for 'Buddy'...")
+
+        if self.sleep_mode and self.running:
+            self._sleep_loop()
+
+    def _sleep_loop(self):
+        print("Entering sleep mode...")
+        self.speak("Going to sleep. Say hey buddy to wake me up.")
+        self._wait_for_tts()
+
+        while self.running and self.sleep_mode:
+            try:
+                if _vosk_available:
+                    if self._vosk_listen_for_wake_word():
+                        self.sleep_mode = False
+                        self._eye(EyeState.WAKING)
+                        self.speak("I am awake. What can I do for you?")
+                        self._wait_for_tts()
+                        break
+                else:
+                    text = self.listen_for_speech()
+                    if text and any(w in text.lower() for w in self._WAKE_WORDS):
+                        self.sleep_mode = False
+                        self._eye(EyeState.WAKING)
+                        self.speak("I am awake. What can I do for you?")
+                        self._wait_for_tts()
+                        break
+            except Exception as exc:
+                self.logger.warning("Sleep loop error: %s", exc)
+                time.sleep(1.0)
+
+        if not self.sleep_mode and self.running:
+            self._wake_loop()
 
     def run(self):
         self.running = True
