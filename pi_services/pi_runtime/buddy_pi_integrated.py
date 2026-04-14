@@ -68,7 +68,7 @@ except Exception as _e:
 
 @dataclass
 class RuntimeSettings:
-    stt_server_ip: str = os.getenv("BUDDY_STT_SERVER_IP", "192.168.0.105")
+    stt_server_ip: str = os.getenv("BUDDY_STT_SERVER_IP", "10.32.50.62")
     stt_port: int = int(os.getenv("BUDDY_STT_PORT", "8765"))
     notification_port: int = int(os.getenv("BUDDY_NOTIFICATION_PORT", "8001"))
     arduino_port: str = os.getenv("BUDDY_ARDUINO_PORT", "/dev/ttyUSB0")
@@ -919,7 +919,12 @@ class BuddyIntegratedPi:
         def _run():
             server = _ThreadedServer(("0.0.0.0", port), _StreamHandler)
             buddy.logger.info("Camera stream at http://<pi-ip>:%s/", port)
-            print(f"📷 Camera stream: http://<pi-ip>:{port}/")
+            import socket
+            try:
+                ip = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                ip = "<pi-ip>"
+            print(f"📷 Camera stream: http://{ip}:{port}/")
             server.serve_forever()
 
         threading.Thread(target=_run, daemon=True).start()
@@ -1045,7 +1050,7 @@ class BuddyIntegratedPi:
     def run(self):
         self.running = True
         self._start_phone_listener()
-        self._start_stream_server(port=8080)
+        self._start_stream_server(port=8090)
         self._camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
         self._camera_thread.start()
         threading.Thread(target=self._startup_greeting, daemon=True).start()
