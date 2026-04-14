@@ -626,19 +626,28 @@ class BuddyIntegratedPi:
         if any(p in lowered for p in ("register my face", "register face", "add my face", "save my face")):
             self.speak("Sure! What's your name?")
             self._wait_for_tts()
-            self.awaiting_name = True
-            return
-
-        # 5. Name reply after registration trigger
-        if self.awaiting_name and any(p in lowered for p in ("my name is", "i am", "i'm", "call me", "name is")):
-            name = self._extract_name(text)
+            time.sleep(0.3)
+            print("[Registration] Listening for name...")
+            self._play_listen_beep()
+            name_text = self.listen_for_speech()
+            if name_text:
+                name = self._extract_name(name_text)
+                if not name:
+                    # treat the whole utterance as the name if no phrase matched
+                    words = [w.strip(".,!?") for w in name_text.split() if w.isalpha() and len(w) > 1]
+                    name = words[0].title() if words else ""
+            else:
+                name = ""
             if name:
-                self.awaiting_name = False
+                print(f"[Registration] Name heard: {name}")
                 self.active_user = name
                 self.speak(f"Nice to meet you {name}! I'll scan your face from different angles. Please look straight at me and hold still.")
                 self._wait_for_tts()
                 threading.Thread(target=self._do_scan_then_save, args=(name,), daemon=True).start()
-                return
+            else:
+                print("[Registration] Could not get name")
+                self.speak("Sorry, I didn't catch your name. Please try again.")
+            return
 
         # 6. Identity check — single scan
         identity_triggers = ("do you know me", "who am i", "do you recognize me", "recognize me", "identify me", "can you see me")
