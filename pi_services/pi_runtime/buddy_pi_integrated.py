@@ -973,24 +973,30 @@ class BuddyIntegratedPi:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
+        print(f"[Vosk] Listening on {self.arecord_device}...")
         try:
             while self.running:
                 raw = proc.stdout.read(8000)
                 if not raw:
+                    print("[Vosk] arecord stream ended")
                     break
                 if self.is_speaking:
                     rec.Reset()
                     continue
                 if rec.AcceptWaveform(raw):
                     text = json.loads(rec.Result()).get("text", "").lower()
+                    if text:
+                        print(f"[Vosk] Final: '{text}'")
                 else:
                     text = json.loads(rec.PartialResult()).get("partial", "").lower()
+                    if text:
+                        print(f"[Vosk] Partial: '{text}'")
                 if text and any(w in text for w in self._WAKE_WORDS):
                     print(f"Wake word: '{text}'")
                     return True
         finally:
             proc.kill()
-            proc.wait()  # MUST wait so mic is fully released before listen_for_speech
+            proc.wait()
         return False
 
     def _startup_greeting(self):
