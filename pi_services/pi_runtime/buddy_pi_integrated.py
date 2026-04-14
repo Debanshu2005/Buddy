@@ -555,8 +555,11 @@ class BuddyIntegratedPi:
             )
             if response.status_code == 200:
                 return response.json()
+            self.logger.warning("Brain returned status %s: %s", response.status_code, response.text[:200])
         except Exception as exc:
             self.logger.warning("Brain call failed: %s", exc)
+            import traceback
+            traceback.print_exc()
         return {
             "reply": "Sorry, I'm having trouble thinking right now.",
             "intent": "conversation",
