@@ -592,21 +592,20 @@ class BuddyIntegratedPi:
 
     def _register_multi_angle(self, name: str):
         if not self.local_vision_enabled or self.detector is None or self.recognizer is None:
-            self.logger.warning("Skipping face registration because local vision is unavailable")
+            self.logger.warning("Skipping face registration — local vision unavailable")
             return
 
         poses = [
-            ("front", "Great. Turn your face slowly to the left and hold still."),
-            ("left", "Perfect. Now turn to the right and hold still."),
-            ("right", "Good. Tilt your face slightly upward."),
-            ("up", "Nice. Now tilt your face slightly downward."),
-            ("down", None),
+            ("front", "Great! Now slowly turn your face to the LEFT and hold it there."),
+            ("left",  "Perfect! Now turn your face to the RIGHT and hold it there."),
+            ("right", "Good! Now tilt your face slightly UP and hold it there."),
+            ("up",    "Almost done! Now tilt your face slightly DOWN and hold it there."),
+            ("down",  None),
         ]
-
         for angle, next_instruction in poses:
-            time.sleep(3.0)
+            time.sleep(4.0)
             captured = False
-            for _ in range(25):
+            for _ in range(30):
                 if self.last_frame is None:
                     time.sleep(0.1)
                     continue
@@ -620,37 +619,58 @@ class BuddyIntegratedPi:
                     continue
                 face_roi = self.last_frame[y:y + h, x:x + w]
                 if self.recognizer.add_face(name, face_roi, angle):
+                    print(f"Captured {angle} for {name}")
                     captured = True
                     break
                 time.sleep(0.1)
-
             if not captured:
                 self.logger.warning("Could not capture %s angle for %s", angle, name)
             if next_instruction:
                 self.speak(next_instruction)
                 self._wait_for_tts()
+        print(f"Multi-angle registration complete for {name}")
 
-    def _process_registration_request(self, text: str) -> bool:
-        if not self.local_vision_enabled:
-            return False
+    def _process_input(self, text: str):
+        lowered = text.lower()
 
-        name = self._extract_name(text)
-        if not name:
-            return False
+        # 1. Stop
+        if self._is_stop_command(lowered):
+            self.motors.stop()
+            self.speak("Stopped.")
+            return
 
-        self.active_user = name
-        self.awaiting_name = False
-        self.speak(
-            f"Nice to meet you {name}. I will scan your face from different angles. Please look straight at me and hold still."
-        )
-        self._wait_for_tts()
-        self._register_multi_angle(name)
-        reply = self._call_brain(
-            f"You just registered {name}'s face from multiple angles. Greet them warmly.",
-            recognized_user=name,
-        )
-        self._display_response(reply)
-        return True
+        # 2. Move
+        movement = self._parse_movement(lowered)
+        if movement is not None:
+            cmd, duration = movement
+            self.motors.move(cmd, duration)
+            self.speak(self._MOTOR_CONFIRMATIONS.get(cmd, "On it."))
+            return
+
+        # 3. Sleep
+        if any(phrase in lowered for phrase in self._SLEEP_PHRASES):
+            self.speak("Going to sleep. Say hey buddy to wake me up.")
+            self._wait_for_tts()
+            self.sleep_mode = True
+            self._eye(EyeState.SLEEPING)
+            return
+
+        # 4. Name introduction → multi-angle registration
+        if self.awaiting_name and any(p in lowered for p in ("my name is", "i am", "i'm", "call me", "name is")):
+            name = self._extract_name(text)
+            if name:
+                self.active_user = name
+                self.awaiting_name = False
+                self.speak(f"Nice to meet you {name}! I'll scan your face from different angles. Please look straight at me and hold still.")
+                self._wait_for_tts()
+                threading.Thread(target=self._do_registration, args=(name,), daemon=True).start()
+                return
+
+        # 5. Brain
+        self._play_thinking_sound()
+        response = self._call_brain(text, self.active_user)
+        self._thinking_token = None
+        self._display_response(response)
 
     def _is_stop_command(self, text: str) -> bool:
         return any(word in text for word in self._STOP_WORDS)
@@ -663,7 +683,6 @@ class BuddyIntegratedPi:
                 break
         if cmd is None:
             return None
-
         duration = None
         match = re.search(r"for\s+(\d+(?:\.\d+)?)\s*(second|sec|minute|min)", text)
         if match:
@@ -671,35 +690,14 @@ class BuddyIntegratedPi:
             duration = value * 60 if match.group(2).startswith("min") else value
         return cmd, duration
 
-    def _process_input(self, text: str):
-        lowered = text.lower()
-
-        if self._is_stop_command(lowered):
-            self.motors.stop()
-            self.speak("Stopped.")
-            return
-
-        movement = self._parse_movement(lowered)
-        if movement is not None:
-            cmd, duration = movement
-            self.motors.move(cmd, duration)
-            self.speak(self._MOTOR_CONFIRMATIONS.get(cmd, "On it."))
-            return
-
-        if any(phrase in lowered for phrase in self._SLEEP_PHRASES):
-            self.speak("Going to sleep. Say hey buddy to wake me up.")
-            self._wait_for_tts()
-            self.sleep_mode = True
-            self._eye(EyeState.SLEEPING)
-            return
-
-        if self._process_registration_request(text):
-            return
-
-        self._play_thinking_sound()
-        response = self._call_brain(text, self.active_user)
-        self._thinking_token = None
-        self._display_response(response)
+    def _do_registration(self, name: str):
+        """Run multi-angle registration then greet — called in background thread."""
+        self._register_multi_angle(name)
+        reply = self._call_brain(
+            f"You just registered {name}'s face from multiple angles. Greet them warmly.",
+            recognized_user=name,
+        )
+        self._display_response(reply)
 
     def _display_response(self, response: dict):
         if not response:
@@ -760,6 +758,7 @@ class BuddyIntegratedPi:
                                 self._last_logged_recognized_name = name
                             if self.active_user != name:
                                 self.active_user = name
+                                self.awaiting_name = False
                                 reply = self._call_brain(
                                     f"You just recognized {name}. Greet them warmly by name.",
                                     recognized_user=name,
@@ -991,7 +990,7 @@ class BuddyIntegratedPi:
                     return True
         finally:
             proc.kill()
-            proc.wait()
+            proc.wait()  # MUST wait so mic is fully released before listen_for_speech
         return False
 
     def _startup_greeting(self):
@@ -1011,6 +1010,7 @@ class BuddyIntegratedPi:
                 continue
 
             print("Wake word detected")
+            time.sleep(0.3)  # let ALSA release the mic before VAD opens it
             self._play_listen_beep()
             self._eye(EyeState.LISTENING)
             user_text = self.listen_for_speech()
