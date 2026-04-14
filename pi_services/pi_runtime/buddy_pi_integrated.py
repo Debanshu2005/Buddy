@@ -334,6 +334,7 @@ class BuddyIntegratedPi:
     def speak(self, text: str):
         if not text.strip():
             return
+        print(f"\nBuddy: {text}")
         self.is_speaking = True
         self._eye(EyeState.SPEAKING)
 
@@ -364,19 +365,25 @@ class BuddyIntegratedPi:
         with open(mp3_path, "wb") as handle:
             handle.write(audio_data)
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", mp3_path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=20,
             )
-        except Exception:
-            subprocess.run(
-                ["aplay", mp3_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=20,
-            )
+            if result.returncode != 0:
+                raise Exception(f"ffplay returned {result.returncode}")
+        except Exception as e:
+            print(f"[TTS] ffplay failed ({e}), trying aplay...")
+            try:
+                subprocess.run(
+                    ["aplay", "-D", self.aplay_device, mp3_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=20,
+                )
+            except Exception as e2:
+                print(f"[TTS] aplay also failed: {e2}")
         finally:
             try:
                 os.remove(mp3_path)
@@ -687,12 +694,13 @@ class BuddyIntegratedPi:
         print(f"[Face check] Result: {name} (confidence: {confidence:.2f})")
         if name != "Unknown" and confidence > 0.45:
             self.active_user = name
-            print(f"[Face check] Match found: {name}")
+            print(f"[Face check] Match found: {name} — speaking greeting")
             self.speak(f"Hi {name}! Good to see you.")
             self._wait_for_tts()
         else:
-            print(f"[Face check] No match (best confidence: {confidence:.2f})")
-            self.speak("I don't recognize you. Say 'register my face' if you'd like me to remember you.")
+            print(f"[Face check] No match (best confidence: {confidence:.2f}) — speaking unknown")
+            self.speak("I don't recognize you. Say register my face if you'd like me to remember you.")
+            self._wait_for_tts()
 
     def _do_scan_then_save(self, name: str):
         """Multi-angle face scan then save under name."""
