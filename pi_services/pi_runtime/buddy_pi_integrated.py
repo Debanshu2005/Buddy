@@ -895,6 +895,8 @@ class BuddyIntegratedPi:
 
         threading.Thread(target=_run, daemon=True).start()
         print(f"📱 Phone notification listener started on port {self.settings.notification_port}")
+
+    def _on_phone_notification(self, notification: dict):
         if notification.get("decision") == "ignore" or self.sleep_mode:
             return
         with self._notif_lock:
