@@ -897,7 +897,13 @@ class BuddyIntegratedPi:
         print(f"📱 Phone notification listener started on port {self.settings.notification_port}")
 
     def _on_phone_notification(self, notification: dict):
+        print(f"\n📱 Notification received!")
+        print(f"   App     : {notification.get('app', '?')}")
+        print(f"   From    : {notification.get('sender', '?')}")
+        print(f"   Message : {notification.get('message', '?')}")
+        print(f"   Decision: {notification.get('decision', '?')}")
         if notification.get("decision") == "ignore" or self.sleep_mode:
+            print("   → Ignored (social noise or sleep mode)")
             return
         with self._notif_lock:
             self._notif_queue.append(notification)
