@@ -138,6 +138,7 @@ class BuddyIntegratedPi:
         self._cleaned_up = False
         self._stream_frame: Optional[bytes] = None
         self._stream_lock = threading.Lock()
+        self._pending_face_scan = False
 
         self.aplay_device, self.usb_card_index = self._find_output_audio_device()
         self.arecord_device = self._find_input_audio_device()
@@ -594,46 +595,6 @@ class BuddyIntegratedPi:
                     return clean.title()
         return ""
 
-    def _register_multi_angle(self, name: str):
-        if not self.local_vision_enabled or self.detector is None or self.recognizer is None:
-            self.logger.warning("Skipping face registration — local vision unavailable")
-            return
-
-        poses = [
-            ("front", "Great! Now slowly turn your face to the LEFT and hold it there."),
-            ("left",  "Perfect! Now turn your face to the RIGHT and hold it there."),
-            ("right", "Good! Now tilt your face slightly UP and hold it there."),
-            ("up",    "Almost done! Now tilt your face slightly DOWN and hold it there."),
-            ("down",  None),
-        ]
-        for angle, next_instruction in poses:
-            time.sleep(4.0)
-            captured = False
-            for _ in range(30):
-                if self.last_frame is None:
-                    time.sleep(0.1)
-                    continue
-                faces = self.detector.detect(self.last_frame)
-                if not faces:
-                    time.sleep(0.1)
-                    continue
-                x, y, w, h = self.detector.get_largest_face(faces)
-                if w <= 80 or h <= 80:
-                    time.sleep(0.1)
-                    continue
-                face_roi = self.last_frame[y:y + h, x:x + w]
-                if self.recognizer.add_face(name, face_roi, angle):
-                    print(f"Captured {angle} for {name}")
-                    captured = True
-                    break
-                time.sleep(0.1)
-            if not captured:
-                self.logger.warning("Could not capture %s angle for %s", angle, name)
-            if next_instruction:
-                self.speak(next_instruction)
-                self._wait_for_tts()
-        print(f"Multi-angle registration complete for {name}")
-
     def _process_input(self, text: str):
         lowered = text.lower()
 
@@ -659,15 +620,30 @@ class BuddyIntegratedPi:
             self._eye(EyeState.SLEEPING)
             return
 
-        # 4. Name introduction → multi-angle registration
-        if self.awaiting_name and any(p in lowered for p in ("my name is", "i am", "i'm", "call me", "name is")):
+        # 4. Name introduction after face scan
+        if (self.awaiting_name or self._pending_face_scan) and any(p in lowered for p in ("my name is", "i am", "i'm", "call me", "name is")):
             name = self._extract_name(text)
             if name:
                 self.active_user = name
                 self.awaiting_name = False
-                self.speak(f"Nice to meet you {name}! I'll scan your face from different angles. Please look straight at me and hold still.")
-                self._wait_for_tts()
-                threading.Thread(target=self._do_registration, args=(name,), daemon=True).start()
+                if self._pending_face_scan:
+                    self._pending_face_scan = False
+                    # rename __pending__ embeddings to real name
+                    try:
+                        self.recognizer.rename_person("__pending__", name)
+                    except Exception:
+                        pass
+                    print(f"Registered: {name}")
+                    reply = self._call_brain(
+                        f"You just registered {name}'s face. Greet them warmly and say you'll remember them.",
+                        recognized_user=name,
+                    )
+                else:
+                    reply = self._call_brain(
+                        f"The user said their name is {name}. Greet them.",
+                        recognized_user=name,
+                    )
+                self._display_response(reply)
                 return
 
         # 5. Brain
@@ -693,15 +669,6 @@ class BuddyIntegratedPi:
             value = float(match.group(1))
             duration = value * 60 if match.group(2).startswith("min") else value
         return cmd, duration
-
-    def _do_registration(self, name: str):
-        """Run multi-angle registration then greet — called in background thread."""
-        self._register_multi_angle(name)
-        reply = self._call_brain(
-            f"You just registered {name}'s face from multiple angles. Greet them warmly.",
-            recognized_user=name,
-        )
-        self._display_response(reply)
 
     def _display_response(self, response: dict):
         if not response:
@@ -1020,7 +987,15 @@ class BuddyIntegratedPi:
                 continue
 
             print("Wake word detected")
-            time.sleep(0.3)  # let ALSA release the mic before VAD opens it
+            time.sleep(0.3)
+
+            # face check blocks here — greet known, or scan+ask name for unknown
+            if self.local_vision_enabled and not self._pending_face_scan:
+                handled = self._handle_wake_face()
+                if handled:  # scan started — skip listening this round
+                    print("Waiting for 'Buddy'...")
+                    continue
+
             self._play_listen_beep()
             self._eye(EyeState.LISTENING)
             user_text = self.listen_for_speech()
@@ -1037,6 +1012,86 @@ class BuddyIntegratedPi:
 
         if self.sleep_mode and self.running:
             self._sleep_loop()
+
+    def _handle_wake_face(self) -> bool:
+        """Check face on wake. Returns True if scan was started (skip listening)."""
+        time.sleep(0.3)
+        if self.last_frame is None or self.detector is None:
+            return False
+
+        faces = self.detector.detect(self.last_frame)
+        if not faces:
+            return False
+
+        x, y, w, h = self.detector.get_largest_face(faces)
+        if w <= 80 or h <= 80:
+            return False
+
+        face_roi = self.last_frame[y:y + h, x:x + w]
+        name, confidence = self.recognizer.recognize(face_roi)
+        print(f"[Face] {name} ({confidence:.2f})")
+
+        if name != "Unknown" and confidence > 0.45:
+            if self.active_user != name:
+                self.active_user = name
+                self.awaiting_name = False
+                print(f"Recognized: {name}")
+                reply = self._call_brain(
+                    f"You just recognized {name}. Greet them warmly by name.",
+                    recognized_user=name,
+                )
+                self._display_response(reply)
+                self._wait_for_tts()
+            return False  # known face — proceed to listen
+        else:
+            # unknown — start scan in background, skip this listen round
+            self.awaiting_name = True
+            self.speak("Hi! I don't recognize you. I'll scan your face. Please look straight at me and hold still.")
+            self._wait_for_tts()
+            threading.Thread(target=self._do_scan_then_ask_name, daemon=True).start()
+            return True  # scan started — skip listen
+
+    def _do_scan_then_ask_name(self):
+        """Multi-angle scan, then ask for name."""
+        poses = [
+            ("front",  "Great! Now slowly turn your face to the LEFT and hold it there."),
+            ("left",   "Perfect! Now turn your face to the RIGHT and hold it there."),
+            ("right",  "Good! Now tilt your face slightly UP and hold it there."),
+            ("up",     "Almost done! Now tilt your face slightly DOWN and hold it there."),
+            ("down",   None),
+        ]
+        temp_name = "__pending__"
+        for angle, next_instruction in poses:
+            time.sleep(4.0)
+            captured = False
+            for _ in range(30):
+                if self.last_frame is None:
+                    time.sleep(0.1)
+                    continue
+                faces = self.detector.detect(self.last_frame)
+                if not faces:
+                    time.sleep(0.1)
+                    continue
+                x, y, w, h = self.detector.get_largest_face(faces)
+                if w <= 80 or h <= 80:
+                    time.sleep(0.1)
+                    continue
+                face_roi = self.last_frame[y:y + h, x:x + w]
+                if self.recognizer.add_face(temp_name, face_roi, angle):
+                    print(f"Captured {angle}")
+                    captured = True
+                    break
+                time.sleep(0.1)
+            if not captured:
+                self.logger.warning("Could not capture %s angle", angle)
+            if next_instruction:
+                self.speak(next_instruction)
+                self._wait_for_tts()
+
+        self.speak("Great! I've scanned your face. What's your name?")
+        self._wait_for_tts()
+        # now wait for user to say their name via wake word → _process_input
+        self._pending_face_scan = True
 
     def _sleep_loop(self):
         print("Entering sleep mode...")
