@@ -285,9 +285,12 @@ class BuddyIntegratedPi:
 
     def _find_input_audio_device(self) -> str:
         cards = self._scan_alsa_cards("arecord")
-        for card_num, card_name, dev_num in cards:
-            if any(token in card_name.lower() for token in ("usb", "seeed", "snd", "audio", "mic", "i2s")):
-                return f"plughw:{card_num},{dev_num}"
+        print(f"[Audio] arecord cards: {cards}")
+        if cards:
+            card_num, card_name, dev_num = cards[0]
+            device = f"plughw:{card_num},{dev_num}"
+            print(f"[Audio] Using mic: {device} ({card_name})")
+            return device
         return "default"
 
     def _generate_beep_wav(self) -> str:
@@ -415,6 +418,7 @@ class BuddyIntegratedPi:
                 if result.returncode == 0:
                     working = device
                     self._working_arecord_device = device
+                    print(f"🎤 VAD using device: {device}")
                     break
             except Exception:
                 continue
