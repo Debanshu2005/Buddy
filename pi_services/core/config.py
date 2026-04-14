@@ -58,7 +58,7 @@ class Config:
     log_format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     
     # LLM Service Configuration
-    llm_service_url: str = "http://192.168.0.169:8000"
+    llm_service_url: str = "http://10.32.50.62:8000"
     
     @classmethod
     def from_env(cls) -> 'Config':

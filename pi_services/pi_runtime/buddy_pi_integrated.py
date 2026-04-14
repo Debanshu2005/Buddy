@@ -445,6 +445,8 @@ class BuddyIntegratedPi:
                 total_duration += target_chunk_secs
 
                 if rms >= speech_thresh:
+                    if not speech_started:
+                        print("🎤️ Speech detected")
                     speech_started = True
                     silence_duration = 0.0
                     speech_duration += target_chunk_secs
@@ -481,12 +483,17 @@ class BuddyIntegratedPi:
             return ""
 
     def listen_for_speech(self) -> str:
+        print("🎤 Listening (VAD)...")
         try:
             if self._listen_loop is None or self._listen_loop.is_closed():
                 self._listen_loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(self._listen_loop)
             text = self._listen_loop.run_until_complete(self._ws_listen_once())
-            return text if len(text) > 1 else ""
+            if text and len(text) > 1:
+                print(f"🎤 Heard: '{text}'")
+                return text
+            print("🔇 No speech detected")
+            return ""
         except Exception as exc:
             self.logger.warning("listen_for_speech failed: %s", exc)
             self._listen_loop = None
@@ -919,9 +926,12 @@ class BuddyIntegratedPi:
         def _run():
             server = _ThreadedServer(("0.0.0.0", port), _StreamHandler)
             buddy.logger.info("Camera stream at http://<pi-ip>:%s/", port)
-            import socket
             try:
-                ip = socket.gethostbyname(socket.gethostname())
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                ip = s.getsockname()[0]
+                s.close()
             except Exception:
                 ip = "<pi-ip>"
             print(f"📷 Camera stream: http://{ip}:{port}/")
