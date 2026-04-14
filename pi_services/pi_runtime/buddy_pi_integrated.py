@@ -392,11 +392,10 @@ class BuddyIntegratedPi:
     def _record_audio_vad(self) -> np.ndarray:
         mic_rate = 48000
         target_chunk_secs = 0.1
-        speech_thresh = 0.008
-        silence_thresh = 0.003
-        silence_after = 0.4
-        min_speech = 0.4
-        max_duration = 8.0
+        speech_thresh = 0.005  # lowered from 0.008 — catches quieter speech
+        silence_after = 0.6    # increased from 0.4 — less likely to cut off mid-sentence
+        min_speech = 0.2       # lowered from 0.4 — accepts shorter utterances
+        max_duration = 10.0    # increased from 8.0
 
         candidates = [self.arecord_device, "default"]
         if self._working_arecord_device:
@@ -991,15 +990,14 @@ class BuddyIntegratedPi:
 
             print("Wake word detected")
             time.sleep(0.3)
-
-            # face check blocks here — greet known, or scan+ask name for unknown
-            if self.local_vision_enabled and not self._pending_face_scan:
-                handled = self._handle_wake_face()
-                if handled:  # scan started — skip listening this round
-                    print("Waiting for 'Buddy'...")
-                    continue
-
             self._play_listen_beep()
+
+            # --- face check ---
+            if self.local_vision_enabled and self.detector is not None:
+                self._handle_wake_face()
+                # if a scan was just started, _pending_face_scan=True
+                # we still listen so user can say their name right after
+
             self._eye(EyeState.LISTENING)
             user_text = self.listen_for_speech()
             self._eye(EyeState.IDLE)
@@ -1016,21 +1014,26 @@ class BuddyIntegratedPi:
         if self.sleep_mode and self.running:
             self._sleep_loop()
 
-    def _handle_wake_face(self) -> bool:
-        """Check face on wake. Returns True if scan was started (skip listening)."""
-        time.sleep(0.3)
-        if self.last_frame is None or self.detector is None:
-            return False
+    def _handle_wake_face(self):
+        """On wake: recognize face. Known → greet. Unknown → multi-angle scan then ask name."""
+        ok, frame = self._read_frame()
+        if not ok or frame is None:
+            frame = self.last_frame
+        if frame is None:
+            print("[Face] No frame available")
+            return
 
-        faces = self.detector.detect(self.last_frame)
+        faces = self.detector.detect(frame)
         if not faces:
-            return False
+            print("[Face] No face detected at wake")
+            return
 
         x, y, w, h = self.detector.get_largest_face(faces)
         if w <= 80 or h <= 80:
-            return False
+            print("[Face] Face too small")
+            return
 
-        face_roi = self.last_frame[y:y + h, x:x + w]
+        face_roi = frame[y:y + h, x:x + w]
         name, confidence = self.recognizer.recognize(face_roi)
         print(f"[Face] {name} ({confidence:.2f})")
 
@@ -1038,21 +1041,17 @@ class BuddyIntegratedPi:
             if self.active_user != name:
                 self.active_user = name
                 self.awaiting_name = False
+                self._pending_face_scan = False
                 print(f"Recognized: {name}")
-                reply = self._call_brain(
-                    f"You just recognized {name}. Greet them warmly by name.",
-                    recognized_user=name,
-                )
-                self._display_response(reply)
+                self.speak(f"Hey {name}, good to see you!")
                 self._wait_for_tts()
-            return False  # known face — proceed to listen
-        else:
-            # unknown — start scan in background, skip this listen round
+        elif not self.awaiting_name and not self._pending_face_scan:
+            # unknown face — do multi-angle scan in background
+            # _wake_loop will still listen after this returns
             self.awaiting_name = True
-            self.speak("Hi! I don't recognize you. I'll scan your face. Please look straight at me and hold still.")
+            self.speak("Hi! I don't recognize you. I'll scan your face from different angles. Please look straight at me and hold still.")
             self._wait_for_tts()
             threading.Thread(target=self._do_scan_then_ask_name, daemon=True).start()
-            return True  # scan started — skip listen
 
     def _do_scan_then_ask_name(self):
         """Multi-angle scan, then ask for name."""
