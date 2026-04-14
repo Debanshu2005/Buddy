@@ -383,7 +383,7 @@ class BuddyIntegratedPi:
             except OSError:
                 pass
 
-    def _wait_for_tts(self, timeout: float = 20.0):
+    def _wait_for_tts(self, timeout: float = 30.0):
         start = time.time()
         while self.is_speaking and (time.time() - start) < timeout:
             time.sleep(0.05)
@@ -551,7 +551,7 @@ class BuddyIntegratedPi:
                     "recognized_user": recognized_user,
                     "objects_visible": objects,
                 },
-                timeout=30,
+                timeout=90,
             )
             if response.status_code == 200:
                 return response.json()

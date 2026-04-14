@@ -62,7 +62,14 @@ class FaceRecognizer:
 
     def _preprocess_face(self, face_img: np.ndarray) -> np.ndarray:
         resized = cv2.resize(face_img, (112, 112))
-        blob = (resized[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) - 127.5) / 127.5
+        # check what layout the model expects
+        input_shape = self.session.get_inputs()[0].shape  # e.g. [1,3,112,112] or [1,112,112,3]
+        if len(input_shape) == 4 and input_shape[1] == 3:
+            # NCHW: (1, 3, 112, 112)
+            blob = (resized[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) - 127.5) / 127.5
+        else:
+            # NHWC: (1, 112, 112, 3)
+            blob = (resized[:, :, ::-1].astype(np.float32) - 127.5) / 127.5
         return np.expand_dims(blob, 0)
 
     def get_embedding(self, face_img: np.ndarray) -> Optional[np.ndarray]:
