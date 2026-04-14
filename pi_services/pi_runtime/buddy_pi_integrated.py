@@ -703,7 +703,7 @@ class BuddyIntegratedPi:
             self._wait_for_tts()
 
     def _do_scan_then_save(self, name: str):
-        """Multi-angle face scan then save under name."""
+        """Multi-angle face scan then save under name. Falls back to normal conversation on failure."""
         poses = [
             ("front", "Great! Now slowly turn your face to the LEFT and hold it there."),
             ("left",  "Perfect! Now turn your face to the RIGHT and hold it there."),
@@ -712,19 +712,26 @@ class BuddyIntegratedPi:
             ("down",  None),
         ]
         total_angles = len(poses)
+        failed_angles = 0
+
         for i, (angle, next_instruction) in enumerate(poses):
             print(f"[Registration] Angle {i+1}/{total_angles}: {angle.upper()} — waiting 5s...")
             time.sleep(5.0)
             print(f"[Registration] Capturing {angle} angle for {name}...")
             captured = False
+
             for attempt in range(30):
                 if self.last_frame is None:
                     time.sleep(0.1)
                     continue
                 faces = self.detector.detect(self.last_frame)
                 if not faces:
-                    if attempt % 5 == 0:
-                        print(f"[Registration] No face detected, retrying... ({attempt+1}/30)")
+                    if attempt == 10:
+                        print(f"[Registration] No face — asking to stay still")
+                        self.speak("Please stay still, I can't see your face.")
+                    elif attempt == 20:
+                        print(f"[Registration] Still no face — trying again")
+                        self.speak("Can't capture, trying again.")
                     time.sleep(0.1)
                     continue
                 x, y, w, h = self.detector.get_largest_face(faces)
@@ -738,9 +745,26 @@ class BuddyIntegratedPi:
                     captured = True
                     break
                 time.sleep(0.1)
+
             if not captured:
-                print(f"[Registration] ⚠️ Could not capture {angle} angle for {name}")
+                failed_angles += 1
+                print(f"[Registration] ⚠️ Failed to capture {angle} angle for {name} (failures so far: {failed_angles})")
                 self.logger.warning("Could not capture %s angle for %s", angle, name)
+                if failed_angles >= 3:
+                    print(f"[Registration] ❌ Too many failures — falling back to default conversation")
+                    self.speak("I'm having trouble scanning your face. Falling back to default conversation. You can still talk to me normally.")
+                    self._wait_for_tts()
+                    # clean up any partial embeddings saved under this name
+                    try:
+                        from memory.pi_memory import delete_person
+                        delete_person(name)
+                        self.recognizer.known_faces.pop(name, None)
+                        print(f"[Registration] Cleaned up partial data for {name}")
+                    except Exception:
+                        pass
+                    self.active_user = None
+                    return
+
             if next_instruction:
                 self.speak(next_instruction)
                 self._wait_for_tts()
