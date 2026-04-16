@@ -78,6 +78,8 @@ class RuntimeSettings:
     object_interval_frames: int = 20
     face_interval_frames: int = 15
     display_enabled: bool = os.getenv("BUDDY_ENABLE_DISPLAY", "1") != "0"
+    pc_camera_ip: str = os.getenv("BUDDY_PC_CAMERA_IP", "10.32.50.62")
+    pc_camera_port: int = int(os.getenv("BUDDY_PC_CAMERA_PORT", "5000"))
 
 
 class BuddyIntegratedPi:
@@ -139,6 +141,8 @@ class BuddyIntegratedPi:
         self._stream_frame: Optional[bytes] = None
         self._stream_lock = threading.Lock()
         self._pending_face_scan = False
+        self._pc_stream_active = False
+        self._pc_stream_thread: Optional[threading.Thread] = None
 
         self.aplay_device, self.usb_card_index = self._find_output_audio_device()
         self.arecord_device = self._find_input_audio_device()
@@ -216,6 +220,13 @@ class BuddyIntegratedPi:
         self.use_csi = False
         self.cap = None
 
+        # Try PC webcam stream first if IP is configured
+        if self.settings.pc_camera_ip:
+            if self._start_pc_stream():
+                self.logger.info("Using PC webcam stream from %s", self.settings.pc_camera_ip)
+                return
+            self.logger.warning("PC stream unavailable, falling back to local camera")
+
         helper_path = ROOT_DIR / "hardware" / "csi_camera_helper.py"
         if shutil.which("rpicam-hello") and helper_path.exists():
             try:
@@ -251,7 +262,55 @@ class BuddyIntegratedPi:
 
         raise RuntimeError("No camera available for Buddy")
 
+    def _start_pc_stream(self) -> bool:
+        """Start background thread pulling frames from the PC MJPEG stream."""
+        import urllib.request
+        url = f"http://{self.settings.pc_camera_ip}:{self.settings.pc_camera_port}/video"
+        try:
+            # Quick connectivity check
+            urllib.request.urlopen(url, timeout=3).close()
+        except Exception as exc:
+            self.logger.warning("PC stream check failed: %s", exc)
+            return False
+
+        self._pc_stream_active = True
+
+        def _pull():
+            import urllib.request
+            while self._pc_stream_active:
+                try:
+                    stream = urllib.request.urlopen(url, timeout=10)
+                    buf = b""
+                    while self._pc_stream_active:
+                        buf += stream.read(4096)
+                        start = buf.find(b"\xff\xd8")
+                        end = buf.find(b"\xff\xd9")
+                        if start != -1 and end != -1:
+                            jpg = buf[start:end + 2]
+                            buf = buf[end + 2:]
+                            frame = cv2.imdecode(
+                                np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR
+                            )
+                            if frame is not None:
+                                self.last_frame = frame
+                except Exception as exc:
+                    self.logger.warning("PC stream interrupted: %s — retrying in 2s", exc)
+                    time.sleep(2.0)
+
+        self._pc_stream_thread = threading.Thread(target=_pull, daemon=True)
+        self._pc_stream_thread.start()
+        # Wait up to 3s for first frame
+        for _ in range(30):
+            if self.last_frame is not None:
+                return True
+            time.sleep(0.1)
+        self.logger.warning("PC stream connected but no frames received")
+        return True  # Still return True — stream may just be slow to start
+
     def _read_frame(self):
+        if self._pc_stream_active:
+            frame = self.last_frame
+            return (True, frame.copy()) if frame is not None else (False, None)
         if self.use_csi and os.path.exists(self.csi_frame_path):
             frame = cv2.imread(self.csi_frame_path)
             return (True, frame) if frame is not None else (False, None)
@@ -1166,6 +1225,7 @@ class BuddyIntegratedPi:
             self.motors.cleanup()
         except Exception:
             pass
+        self._pc_stream_active = False
         if self.cap is not None:
             try:
                 self.cap.release()
