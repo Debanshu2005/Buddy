@@ -32,8 +32,9 @@ def get_frame_stream():
 
 if __name__ == "__main__":
     print(f"[Camera Client] Connecting to {STREAM_URL}")
-    for frame in get_frame_stream():
-        cv2.imshow("PC Camera Feed", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+    for i, frame in enumerate(get_frame_stream()):
+        if i % 30 == 0:
+            print(f"[Camera Client] Receiving frames... shape={frame.shape}")
+        if i >= 90:  # print for 3 seconds then exit
+            print("[Camera Client] Stream working correctly.")
             break
-    cv2.destroyAllWindows()
