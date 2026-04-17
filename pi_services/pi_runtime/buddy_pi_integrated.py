@@ -488,15 +488,15 @@ class BuddyIntegratedPi:
         start = time.time()
         while self.is_speaking and (time.time() - start) < timeout:
             time.sleep(0.05)
-        time.sleep(0.1)
+        time.sleep(0.05)
 
     def _record_audio_vad(self) -> np.ndarray:
         mic_rate = 48000
         target_chunk_secs = 0.1
         speech_thresh = 0.005
-        silence_after = 0.6
-        min_speech = 0.2
-        max_duration = 10.0
+        silence_after = 0.4
+        min_speech = 0.1
+        max_duration = 8.0
 
         # use cached device — skip probe after first successful use
         if self._working_arecord_device:
@@ -666,7 +666,7 @@ class BuddyIntegratedPi:
         self.motors.emotion_move("thinking")
 
         def _run():
-            time.sleep(0.5)
+            time.sleep(0.2)
             if self._thinking_token == token:
                 self.speak(random.choice(self._THINK_SOUNDS))
 
@@ -719,7 +719,7 @@ class BuddyIntegratedPi:
         if any(p in lowered for p in ("register my face", "register face", "add my face", "save my face")):
             self.speak("Sure! What's your name?")
             self._wait_for_tts()
-            time.sleep(0.3)
+            time.sleep(0.1)
             print("[Registration] Listening for name...")
             self._play_listen_beep()
             name_text = self.listen_for_speech()
