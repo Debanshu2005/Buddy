@@ -79,7 +79,7 @@ class RuntimeSettings:
     object_interval_frames: int = 20
     face_interval_frames: int = 15
     display_enabled: bool = os.getenv("BUDDY_ENABLE_DISPLAY", "1") != "0"
-    pc_camera_ip: str = os.getenv("BUDDY_PC_CAMERA_IP", "10.32.50.62")
+    pc_camera_ip: str = os.getenv("BUDDY_PC_CAMERA_IP", "10.142.68.62")
     pc_camera_port: int = int(os.getenv("BUDDY_PC_CAMERA_PORT", "5000"))
 
 
@@ -295,7 +295,8 @@ class BuddyIntegratedPi:
                 return
             cap.release()
 
-        raise RuntimeError("No camera available for Buddy")
+        self.logger.warning("No local camera found — running in camera-less mode")
+        self.cap = None
 
     def _start_pc_stream(self) -> bool:
         """Start background thread pulling frames from the PC MJPEG stream."""
