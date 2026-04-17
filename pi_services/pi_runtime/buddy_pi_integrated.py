@@ -68,8 +68,7 @@ except Exception as _e:
 
 @dataclass
 class RuntimeSettings:
-    stt_server_ip: str = os.getenv("BUDDY_STT_SERVER_IP", "10.32.50.62")
-    stt_server_ip_fallback: str = os.getenv("BUDDY_STT_SERVER_IP_FALLBACK", "10.142.68.57")
+    stt_server_ip: str = "buddypc.local"
     stt_port: int = int(os.getenv("BUDDY_STT_PORT", "8765"))
     notification_port: int = int(os.getenv("BUDDY_NOTIFICATION_PORT", "8001"))
     arduino_port: str = os.getenv("BUDDY_ARDUINO_PORT", "/dev/ttyUSB0")
@@ -579,22 +578,15 @@ class BuddyIntegratedPi:
             return ""
 
         audio_16k = resample_poly(audio, 16000, 48000).astype(np.float32)
-        ips = [self.settings.stt_server_ip]
-        if self.settings.stt_server_ip_fallback and self.settings.stt_server_ip_fallback != self.settings.stt_server_ip:
-            ips.append(self.settings.stt_server_ip_fallback)
-        for ip in ips:
-            uri = f"ws://{ip}:{self.settings.stt_port}"
-            try:
-                async with websockets.connect(uri, open_timeout=3) as websocket:
-                    await websocket.send(audio_16k.tobytes())
-                    result = await websocket.recv()
-                    if ip != self.settings.stt_server_ip:
-                        print(f"[STT] Using fallback: {ip}")
-                    return result.strip() if result else ""
-            except Exception as exc:
-                self.logger.warning("STT failed for %s: %s", ip, exc)
-                continue
-        return ""
+        uri = f"ws://{self.settings.stt_server_ip}:{self.settings.stt_port}"
+        try:
+            async with websockets.connect(uri) as websocket:
+                await websocket.send(audio_16k.tobytes())
+                result = await websocket.recv()
+                return result.strip() if result else ""
+        except Exception as exc:
+            self.logger.warning("STT websocket failed: %s", exc)
+            return ""
 
     def listen_for_speech(self) -> str:
         print("🎤 Listening (VAD)...")
