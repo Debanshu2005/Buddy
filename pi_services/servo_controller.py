@@ -3,7 +3,7 @@ ServoController — GPIO PWM servo control for camera tilt.
 
 Servo specs:
   - Standard hobby servo (SG90 or similar)
-  - Connected to GPIO 4 (physical pin 7)
+  - Connected to GPIO 18 (physical pin 12)
   - 50 Hz PWM, duty cycle 2.5% (0°) to 12.5% (180°)
   
 Positions:
@@ -16,7 +16,7 @@ import RPi.GPIO as GPIO
 import time
 import threading
 
-SERVO_PIN = 4  # GPIO4 (physical pin 7)
+SERVO_PIN = 18  # GPIO18 (physical pin 12) — hardware PWM
 PWM_FREQ  = 50 # Hz (standard servo frequency)
 
 # Angle → duty cycle conversion

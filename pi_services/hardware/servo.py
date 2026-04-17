@@ -1,7 +1,7 @@
 import RPi.GPIO as GPIO
 import time
 
-SERVO_PIN = 4  # GPIO4
+SERVO_PIN = 18  # GPIO18 (physical pin 12) — hardware PWM
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(SERVO_PIN, GPIO.OUT)
