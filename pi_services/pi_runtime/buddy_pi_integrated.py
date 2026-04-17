@@ -637,25 +637,21 @@ class BuddyIntegratedPi:
                         self.persistent_objects.update(self.current_objects)
 
         objects = list(self.current_objects or self.persistent_objects)
-        payload = {
-            "user_input": user_input,
-            "recognized_user": recognized_user,
-            "objects_visible": objects,
-        }
-        urls = [self.config.llm_service_url]
-        if hasattr(self.config, 'llm_service_url_fallback') and self.config.llm_service_url_fallback:
-            urls.append(self.config.llm_service_url_fallback)
-        for url in urls:
-            try:
-                response = requests.post(f"{url}/chat", json=payload, timeout=90)
-                if response.status_code == 200:
-                    if url != self.config.llm_service_url:
-                        print(f"[Brain] Using fallback URL: {url}")
-                    return response.json()
-                self.logger.warning("Brain returned status %s from %s", response.status_code, url)
-            except Exception as exc:
-                self.logger.warning("Brain call failed for %s: %s", url, exc)
-                continue
+        try:
+            response = requests.post(
+                f"{self.config.llm_service_url}/chat",
+                json={
+                    "user_input": user_input,
+                    "recognized_user": recognized_user,
+                    "objects_visible": objects,
+                },
+                timeout=90,
+            )
+            if response.status_code == 200:
+                return response.json()
+            self.logger.warning("Brain returned status %s", response.status_code)
+        except Exception as exc:
+            self.logger.warning("Brain call failed: %s", exc)
         return {
             "reply": "Sorry, I'm having trouble thinking right now.",
             "intent": "conversation",
