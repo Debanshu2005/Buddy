@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw
 
 _W, _H = 128, 64
 _CX, _CY = 64, 32
-_BLUE = "blue"
+_BLUE = 1    # mode '1': 1=white pixel, 0=black pixel
 
 
 class EyeState(Enum):
@@ -58,14 +58,14 @@ def _draw_eye(draw: ImageDraw.ImageDraw, eye: _Eye):
     # pupil
     pr = 9
     px, py = eye.cx + eye.pupil_dx, eye.cy + eye.pupil_dy
-    draw.ellipse([px - pr, py - pr, px + pr, py + pr], fill="black")
+    draw.ellipse([px - pr, py - pr, px + pr, py + pr], fill=0)
 
     # upper lid
     if eye.lid > 0:
-        draw.rectangle([x0, y0, x1, y0 + int(eye.h * 2 * eye.lid)], fill="black")
+        draw.rectangle([x0, y0, x1, y0 + int(eye.h * 2 * eye.lid)], fill=0)
     # lower lid
     if eye.lid > 0:
-        draw.rectangle([x0, y1 - int(eye.h * eye.lid), x1, y1], fill="black")
+        draw.rectangle([x0, y1 - int(eye.h * eye.lid), x1, y1], fill=0)
 
     # eyebrow — thick line above the eye
     # left end = outer (x0+4), right end = inner (x1-4)
@@ -78,10 +78,10 @@ def _draw_eye(draw: ImageDraw.ImageDraw, eye: _Eye):
 
 
 def _render(device, eye: _Eye):
-    img = Image.new("RGB", (_W, _H), "black")
+    img = Image.new("1", (_W, _H), 0)
     draw = ImageDraw.Draw(img)
     _draw_eye(draw, eye)
-    device.display(img.convert(device.mode))
+    device.display(img)
 
 
 class OledEye:
