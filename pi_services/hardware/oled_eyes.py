@@ -27,6 +27,11 @@ class EyeState(Enum):
     SPEAKING  = "speaking"
     HAPPY     = "happy"
     SURPRISED = "surprised"
+    PROUD     = "proud"
+    EXCITED   = "excited"
+    SAD       = "sad"
+    ANGRY     = "angry"
+    CURIOUS   = "curious"
 
 
 @dataclass
@@ -150,8 +155,45 @@ class OledEye:
             if state == EyeState.HAPPY:
                 eye.lid = 0.35
                 eye.cy -= 4
-                eye.brow_y    = -12  # high raised
-                eye.brow_tilt = -3   # slight arch
+                eye.brow_y    = -12
+                eye.brow_tilt = -3
+
+            if state == EyeState.PROUD:
+                # half-closed confident look, brow raised on outer end
+                eye.lid       = 0.25
+                eye.cy       -= 3
+                eye.brow_y    = -13
+                eye.brow_tilt = -5   # strong arch
+                eye.pupil_dy  = -4   # looking slightly up
+
+            if state == EyeState.EXCITED:
+                # wide open, bouncing
+                eye.w, eye.h  = 34, 28
+                eye.brow_y    = -13
+                eye.brow_tilt = -4
+                bob += bob_dir * 2
+                if abs(bob) >= 4:
+                    bob_dir *= -1
+                eye.cy += bob
+
+            if state == EyeState.SAD:
+                eye.lid       = 0.2
+                eye.cy       += 3
+                eye.brow_y    = -5
+                eye.brow_tilt = 5    # droopy inner = sad V
+                eye.pupil_dy  = 5    # looking down
+
+            if state == EyeState.ANGRY:
+                eye.brow_y    = -5
+                eye.brow_tilt = 8    # heavy furrowed V
+                eye.pupil_dy  = 3
+
+            if state == EyeState.CURIOUS:
+                eye.w, eye.h  = 32, 26
+                eye.brow_y    = -11
+                eye.brow_tilt = -2
+                # pupil drifts right — looking sideways
+                eye.pupil_dx  = 7
 
             if state == EyeState.SURPRISED:
                 eye.w, eye.h  = 36, 30

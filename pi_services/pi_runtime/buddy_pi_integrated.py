@@ -107,6 +107,40 @@ class BuddyIntegratedPi:
         "Thinking.",
     )
 
+    # emotion string from LLM -> (EyeState, servo_action, motor_cmd)
+    # servo_action: "up" | "down" | "center" | None
+    _EMOTION_MAP = {
+        "happy":        (EyeState.HAPPY,     None,      "W"),
+        "joyful":       (EyeState.HAPPY,     None,      "W"),
+        "cheerful":     (EyeState.HAPPY,     None,      "W"),
+        "delighted":    (EyeState.HAPPY,     None,      "W"),
+        "friendly":     (EyeState.HAPPY,     None,      "W"),
+        "playful":      (EyeState.EXCITED,   None,      "W"),
+        "excited":      (EyeState.EXCITED,   None,      "W"),
+        "enthusiastic": (EyeState.EXCITED,   None,      "W"),
+        "proud":        (EyeState.PROUD,     "up",      "W"),
+        "confident":    (EyeState.PROUD,     "up",      None),
+        "curious":      (EyeState.CURIOUS,   None,      "PAN"),
+        "interested":   (EyeState.CURIOUS,   None,      "PAN"),
+        "inquisitive":  (EyeState.CURIOUS,   None,      "PAN"),
+        "surprised":    (EyeState.SURPRISED, None,      "F"),
+        "shocked":      (EyeState.SURPRISED, None,      "F"),
+        "amazed":       (EyeState.SURPRISED, None,      "F"),
+        "thinking":     (EyeState.THINKING,  None,      "T"),
+        "confused":     (EyeState.THINKING,  None,      "T"),
+        "uncertain":    (EyeState.THINKING,  None,      "T"),
+        "pondering":    (EyeState.THINKING,  None,      "T"),
+        "thoughtful":   (EyeState.THINKING,  None,      "T"),
+        "sad":          (EyeState.SAD,       "down",    "B"),
+        "unhappy":      (EyeState.SAD,       "down",    "B"),
+        "disappointed": (EyeState.SAD,       "down",    "B"),
+        "sorry":        (EyeState.SAD,       "down",    "B"),
+        "apologetic":   (EyeState.SAD,       "down",    "B"),
+        "angry":        (EyeState.ANGRY,     None,      "B"),
+        "frustrated":   (EyeState.ANGRY,     None,      "B"),
+        "annoyed":      (EyeState.ANGRY,     None,      "B"),
+    }
+
     def __init__(self, config: Optional[Config] = None, settings: Optional[RuntimeSettings] = None):
         self.config = config or Config.from_env()
         self.settings = settings or RuntimeSettings()
@@ -852,10 +886,31 @@ class BuddyIntegratedPi:
             duration = value * 60 if match.group(2).startswith("min") else value
         return cmd, duration
 
+    def _apply_emotion(self, emotion: str):
+        """Set OLED eye, servo position and motor animation from emotion string."""
+        entry = self._EMOTION_MAP.get(emotion.lower().strip())
+        if not entry:
+            return
+        eye_state, servo_action, motor_cmd = entry
+        print(f"[EMOTION: {emotion}] eye={eye_state.value} servo={servo_action} motor={motor_cmd}")
+
+        self._eye(eye_state)
+
+        if servo_action and hasattr(self, "servo") and self.servo and getattr(self, "servo_enabled", False):
+            if servo_action == "up":
+                threading.Thread(target=self.servo.look_up, daemon=True).start()
+            elif servo_action == "down":
+                threading.Thread(target=self.servo.look_down, daemon=True).start()
+            elif servo_action == "center":
+                threading.Thread(target=self.servo.look_center, daemon=True).start()
+
+        if motor_cmd and self.motors.is_connected():
+            threading.Timer(0.3, lambda e=motor_cmd: self.motors.emotion_move(e)).start()
+
     def _display_response(self, response: dict):
         if not response:
             return
-        reply = response.get("reply", "")
+        reply  = response.get("reply", "")
         intent = response.get("intent", "conversation")
         emotion = response.get("emotion", "")
         print(f"\nBuddy: {reply}")
@@ -871,9 +926,7 @@ class BuddyIntegratedPi:
         elif intent == "stop":
             self.motors.stop()
         if emotion:
-            print(f"[EMOTION: {emotion}]")
-            if self.motors.is_connected():
-                threading.Timer(0.3, lambda e=emotion: self.motors.emotion_move(e)).start()
+            self._apply_emotion(emotion)
         self.speak(reply)
 
     def _process_frame(self, frame: np.ndarray):
