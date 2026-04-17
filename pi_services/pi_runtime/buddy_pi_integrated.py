@@ -487,41 +487,42 @@ class BuddyIntegratedPi:
         start = time.time()
         while self.is_speaking and (time.time() - start) < timeout:
             time.sleep(0.05)
-        time.sleep(0.2)
+        time.sleep(0.1)
 
     def _record_audio_vad(self) -> np.ndarray:
         mic_rate = 48000
         target_chunk_secs = 0.1
-        speech_thresh = 0.005  # lowered from 0.008 — catches quieter speech
-        silence_after = 0.6    # increased from 0.4 — less likely to cut off mid-sentence
-        min_speech = 0.2       # lowered from 0.4 — accepts shorter utterances
-        max_duration = 10.0    # increased from 8.0
+        speech_thresh = 0.005
+        silence_after = 0.6
+        min_speech = 0.2
+        max_duration = 10.0
 
-        candidates = [self.arecord_device, "default"]
+        # use cached device — skip probe after first successful use
         if self._working_arecord_device:
-            candidates.insert(0, self._working_arecord_device)
-
-        working = None
-        for device in candidates:
-            try:
-                probe = tempfile.mktemp(suffix=".wav")
-                result = subprocess.run(
-                    ["arecord", "-D", device, "-f", "S16_LE", "-r", str(mic_rate), "-c", "1", "-d", "1", probe],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=4,
-                )
+            working = self._working_arecord_device
+        else:
+            candidates = [self.arecord_device, "default"]
+            working = None
+            for device in candidates:
                 try:
-                    os.remove(probe)
-                except OSError:
-                    pass
-                if result.returncode == 0:
-                    working = device
-                    self._working_arecord_device = device
-                    print(f"🎤 VAD using device: {device}")
-                    break
-            except Exception:
-                continue
+                    probe = tempfile.mktemp(suffix=".wav")
+                    result = subprocess.run(
+                        ["arecord", "-D", device, "-f", "S16_LE", "-r", str(mic_rate), "-c", "1", "-d", "1", probe],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=4,
+                    )
+                    try:
+                        os.remove(probe)
+                    except OSError:
+                        pass
+                    if result.returncode == 0:
+                        working = device
+                        self._working_arecord_device = device
+                        print(f"🎤 VAD using device: {device}")
+                        break
+                except Exception:
+                    continue
 
         if not working:
             return np.array([], dtype=np.float32)
@@ -625,12 +626,14 @@ class BuddyIntegratedPi:
         user_lower = user_input.lower()
 
         if any(p in user_lower for p in ("what is", "what do you see", "in my hand", "holding")):
-            ok, frame = self._read_frame()
-            if ok and frame is not None and self.local_vision_enabled and self.object_detector:
-                fresh = self.object_detector.detect(frame)
-                if fresh:
-                    self.current_objects = [d["name"] for d in fresh if d["name"] != "person"]
-                    self.persistent_objects.update(self.current_objects)
+            # use already-detected objects from camera loop — no extra detection call
+            if not self.current_objects and self.local_vision_enabled and self.object_detector:
+                ok, frame = self._read_frame()
+                if ok and frame is not None:
+                    fresh = self.object_detector.detect(frame)
+                    if fresh:
+                        self.current_objects = [d["name"] for d in fresh if d["name"] != "person"]
+                        self.persistent_objects.update(self.current_objects)
 
         objects = list(self.current_objects or self.persistent_objects)
         try:
@@ -664,7 +667,7 @@ class BuddyIntegratedPi:
         self.motors.emotion_move("thinking")
 
         def _run():
-            time.sleep(1.2)
+            time.sleep(0.5)
             if self._thinking_token == token:
                 self.speak(random.choice(self._THINK_SOUNDS))
 
