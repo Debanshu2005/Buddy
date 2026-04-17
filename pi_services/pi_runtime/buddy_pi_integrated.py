@@ -69,6 +69,7 @@ except Exception as _e:
 @dataclass
 class RuntimeSettings:
     stt_server_ip: str = os.getenv("BUDDY_STT_SERVER_IP", "10.32.50.62")
+    stt_server_ip_fallback: str = os.getenv("BUDDY_STT_SERVER_IP_FALLBACK", "10.142.68.57")
     stt_port: int = int(os.getenv("BUDDY_STT_PORT", "8765"))
     notification_port: int = int(os.getenv("BUDDY_NOTIFICATION_PORT", "8001"))
     arduino_port: str = os.getenv("BUDDY_ARDUINO_PORT", "/dev/ttyUSB0")
@@ -577,15 +578,22 @@ class BuddyIntegratedPi:
             return ""
 
         audio_16k = resample_poly(audio, 16000, 48000).astype(np.float32)
-        uri = f"ws://{self.settings.stt_server_ip}:{self.settings.stt_port}"
-        try:
-            async with websockets.connect(uri) as websocket:
-                await websocket.send(audio_16k.tobytes())
-                result = await websocket.recv()
-                return result.strip() if result else ""
-        except Exception as exc:
-            self.logger.warning("STT websocket failed: %s", exc)
-            return ""
+        ips = [self.settings.stt_server_ip]
+        if self.settings.stt_server_ip_fallback and self.settings.stt_server_ip_fallback != self.settings.stt_server_ip:
+            ips.append(self.settings.stt_server_ip_fallback)
+        for ip in ips:
+            uri = f"ws://{ip}:{self.settings.stt_port}"
+            try:
+                async with websockets.connect(uri, open_timeout=3) as websocket:
+                    await websocket.send(audio_16k.tobytes())
+                    result = await websocket.recv()
+                    if ip != self.settings.stt_server_ip:
+                        print(f"[STT] Using fallback: {ip}")
+                    return result.strip() if result else ""
+            except Exception as exc:
+                self.logger.warning("STT failed for %s: %s", ip, exc)
+                continue
+        return ""
 
     def listen_for_speech(self) -> str:
         print("🎤 Listening (VAD)...")
@@ -636,23 +644,25 @@ class BuddyIntegratedPi:
                         self.persistent_objects.update(self.current_objects)
 
         objects = list(self.current_objects or self.persistent_objects)
-        try:
-            response = requests.post(
-                f"{self.config.llm_service_url}/chat",
-                json={
-                    "user_input": user_input,
-                    "recognized_user": recognized_user,
-                    "objects_visible": objects,
-                },
-                timeout=90,
-            )
-            if response.status_code == 200:
-                return response.json()
-            self.logger.warning("Brain returned status %s: %s", response.status_code, response.text[:200])
-        except Exception as exc:
-            self.logger.warning("Brain call failed: %s", exc)
-            import traceback
-            traceback.print_exc()
+        payload = {
+            "user_input": user_input,
+            "recognized_user": recognized_user,
+            "objects_visible": objects,
+        }
+        urls = [self.config.llm_service_url]
+        if hasattr(self.config, 'llm_service_url_fallback') and self.config.llm_service_url_fallback:
+            urls.append(self.config.llm_service_url_fallback)
+        for url in urls:
+            try:
+                response = requests.post(f"{url}/chat", json=payload, timeout=90)
+                if response.status_code == 200:
+                    if url != self.config.llm_service_url:
+                        print(f"[Brain] Using fallback URL: {url}")
+                    return response.json()
+                self.logger.warning("Brain returned status %s from %s", response.status_code, url)
+            except Exception as exc:
+                self.logger.warning("Brain call failed for %s: %s", url, exc)
+                continue
         return {
             "reply": "Sorry, I'm having trouble thinking right now.",
             "intent": "conversation",

@@ -59,7 +59,8 @@ class Config:
     
     # LLM Service Configuration
     llm_service_url: str = "http://10.32.50.62:8000"
-    
+    llm_service_url_fallback: str = "http://10.142.68.57:8000"
+
     @classmethod
     def from_env(cls) -> 'Config':
         """Load configuration from environment variables"""
@@ -68,4 +69,5 @@ class Config:
         config.camera_index = int(os.getenv('BUDDY_CAMERA_INDEX', str(config.camera_index)))
         config.log_level = os.getenv('BUDDY_LOG_LEVEL', config.log_level)
         config.llm_service_url = os.getenv('LLM_SERVICE_URL', config.llm_service_url)
+        config.llm_service_url_fallback = os.getenv('LLM_SERVICE_URL_FALLBACK', config.llm_service_url_fallback)
         return config
