@@ -9,7 +9,7 @@ import cv2
 import urllib.request
 import numpy as np
 
-PC_IP = "10.32.50.62"
+PC_IP = "buddypc.local"
 PC_PORT = 5000
 STREAM_URL = f"http://{PC_IP}:{PC_PORT}/video"
 
