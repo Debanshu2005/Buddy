@@ -624,15 +624,6 @@ class BuddyIntegratedPi:
     def _call_brain(self, user_input: str, recognized_user: Optional[str] = None) -> dict:
         user_lower = user_input.lower()
 
-        identity_patterns = [
-            "who am i", "who is this", "who is here", "who do you see",
-            "recognize me", "can you see me", "do you know me", "identify me",
-        ]
-        if any(p in user_lower for p in identity_patterns):
-            found = self._force_face_recognition()
-            if found:
-                recognized_user = found
-
         if any(p in user_lower for p in ("what is", "what do you see", "in my hand", "holding")):
             ok, frame = self._read_frame()
             if ok and frame is not None and self.local_vision_enabled and self.object_detector:
@@ -750,7 +741,12 @@ class BuddyIntegratedPi:
             return
 
         # 6. Identity check — single scan
-        identity_triggers = ("do you know me", "who am i", "do you recognize me", "recognize me", "identify me", "can you see me")
+        identity_triggers = (
+            "do you know me", "who am i", "do you recognize me",
+            "recognize me", "identify me", "can you see me",
+            "do you remember me", "remember me", "have we met",
+            "do you know who i am", "who is this",
+        )
         if any(p in lowered for p in identity_triggers):
             self._check_and_greet_face()
             return
