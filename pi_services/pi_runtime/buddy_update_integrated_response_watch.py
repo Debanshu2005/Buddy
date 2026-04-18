@@ -44,6 +44,11 @@ import numpy as np
 import requests
 from scipy.signal import resample_poly
 
+try:
+    from gpiozero import DistanceSensor
+except Exception:
+    DistanceSensor = None
+
 from core.config import Config
 from core.stability_tracker import StabilityTracker
 from hardware.motor_controller import MotorController
@@ -92,6 +97,11 @@ class RuntimeSettings:
     display_enabled: bool = os.getenv("BUDDY_ENABLE_DISPLAY", "1") != "0"
     pc_camera_ip: str = os.getenv("BUDDY_PC_CAMERA_IP", "buddypc.local")
     pc_camera_port: int = 5000
+    ultrasonic_enabled: bool = os.getenv("BUDDY_ENABLE_ULTRASONIC", "0") == "1"
+    ultrasonic_trigger_pin: int = int(os.getenv("BUDDY_ULTRASONIC_TRIGGER_PIN", "23"))
+    ultrasonic_echo_pin: int = int(os.getenv("BUDDY_ULTRASONIC_ECHO_PIN", "24"))
+    ultrasonic_stop_distance_m: float = float(os.getenv("BUDDY_ULTRASONIC_STOP_DISTANCE_M", "0.28"))
+    ultrasonic_max_distance_m: float = float(os.getenv("BUDDY_ULTRASONIC_MAX_DISTANCE_M", "2.0"))
 
 
 class BuddyIntegratedPi:
@@ -140,6 +150,8 @@ class BuddyIntegratedPi:
     _FOLLOW_CENTER_TOLERANCE = 0.18
     _FOLLOW_COMMAND_INTERVAL = 0.35
     _FOLLOW_LOST_TIMEOUT = 2.5
+    _ULTRASONIC_POLL_INTERVAL = 0.15
+    _ULTRASONIC_ANNOUNCE_COOLDOWN = 3.0
     _SERVO_FACE_CENTER_TOLERANCE = 0.05
     _SERVO_FACE_GAIN = 48.0
     _SERVO_FACE_MIN_ANGLE = 30.0
@@ -264,11 +276,16 @@ class BuddyIntegratedPi:
         self.servo = None
         self.servo_enabled = False
         self._servo_face_last_update = 0.0
-        self._servo_face_tracking_enabled = os.getenv("BUDDY_SERVO_FACE_TRACKING", "1") != "0"
+        self._servo_face_tracking_enabled = False
         self._bbox_fall_started_at: Optional[float] = None
         self._bbox_fall_last_alert_time = 0.0
         self._blood_detect_started_at: Optional[float] = None
         self._blood_last_alert_time = 0.0
+        self._ultrasonic_sensor = None
+        self._ultrasonic_thread: Optional[threading.Thread] = None
+        self._ultrasonic_blocked = False
+        self._ultrasonic_distance_m: Optional[float] = None
+        self._ultrasonic_last_announce_time = 0.0
 
         self._behavior_pipeline = None
         if os.getenv("BUDDY_ENABLE_MEDIAPIPE_BEHAVIOR", "0") == "1":
@@ -309,6 +326,7 @@ class BuddyIntegratedPi:
                 "Motor controller not connected. Set BUDDY_ARDUINO_PORT if auto-detect did not find your Arduino."
             )
         self._init_servo()
+        self._init_ultrasonic_sensor()
 
         self.tts_voice = "en-IN-NeerjaNeural"
         self.speech_enabled = True
@@ -343,6 +361,112 @@ class BuddyIntegratedPi:
             self.servo = None
             self.servo_enabled = False
             self.logger.warning("Servo unavailable: %s", exc)
+
+    def _init_ultrasonic_sensor(self):
+        if not self.settings.ultrasonic_enabled:
+            self.logger.info("Ultrasonic stop sensor disabled")
+            return
+        if DistanceSensor is None:
+            self.logger.warning("Ultrasonic sensor requested but gpiozero is unavailable")
+            return
+        try:
+            self._ultrasonic_sensor = DistanceSensor(
+                echo=self.settings.ultrasonic_echo_pin,
+                trigger=self.settings.ultrasonic_trigger_pin,
+                max_distance=self.settings.ultrasonic_max_distance_m,
+            )
+        except Exception as exc:
+            self._ultrasonic_sensor = None
+            self.logger.warning("Ultrasonic sensor unavailable: %s", exc)
+            return
+
+        self._ultrasonic_thread = threading.Thread(target=self._ultrasonic_loop, daemon=True)
+        self._ultrasonic_thread.start()
+        self.logger.info(
+            "Ultrasonic stop sensor enabled on trigger GPIO %s / echo GPIO %s (stop < %.2fm)",
+            self.settings.ultrasonic_trigger_pin,
+            self.settings.ultrasonic_echo_pin,
+            self.settings.ultrasonic_stop_distance_m,
+        )
+
+    def _ultrasonic_loop(self):
+        while self.running is False and not self._cleaned_up:
+            time.sleep(0.05)
+        while not self._cleaned_up:
+            sensor = self._ultrasonic_sensor
+            if sensor is None:
+                return
+            try:
+                distance_m = float(sensor.distance) * float(self.settings.ultrasonic_max_distance_m)
+                self._ultrasonic_distance_m = distance_m
+                self._set_ultrasonic_blocked(distance_m <= self.settings.ultrasonic_stop_distance_m)
+            except Exception as exc:
+                self.logger.debug("Ultrasonic read failed: %s", exc)
+            time.sleep(self._ULTRASONIC_POLL_INTERVAL)
+
+    def _set_ultrasonic_blocked(self, blocked: bool):
+        if blocked == self._ultrasonic_blocked:
+            return
+        self._ultrasonic_blocked = blocked
+        if blocked:
+            self._follow_last_command = "S"
+            self.motors.stop()
+            self._announce_proximity_stop(force=True)
+        else:
+            if not self.is_speaking:
+                self.speak("Path is clear.")
+
+    def _announce_proximity_stop(self, force: bool = False):
+        now = time.time()
+        if not force and (now - self._ultrasonic_last_announce_time) < self._ULTRASONIC_ANNOUNCE_COOLDOWN:
+            return
+        if self.is_speaking:
+            return
+        self._ultrasonic_last_announce_time = now
+        distance_m = self._ultrasonic_distance_m
+        if distance_m is None:
+            self.speak("Object too close. I have stopped.")
+            return
+        distance_cm = int(distance_m * 100)
+        self.speak(f"Object too close at about {distance_cm} centimeters. I have stopped.")
+
+    def _movement_allowed(self, cmd: str, *, announce: bool = True) -> bool:
+        if cmd == "S":
+            return True
+        if self._ultrasonic_blocked:
+            self._follow_last_command = "S"
+            self.motors.stop()
+            if announce:
+                self._announce_proximity_stop()
+            return False
+        return True
+
+    def _handle_servo_command(self, lowered: str) -> bool:
+        if "look up" in lowered:
+            if not self.servo_enabled or not self.servo:
+                self.speak("I cannot move my head right now because the servo is not available.")
+                return True
+            threading.Thread(target=self.servo.look_up, daemon=True).start()
+            self.speak("Looking up.")
+            return True
+
+        if "look down" in lowered:
+            if not self.servo_enabled or not self.servo:
+                self.speak("I cannot move my head right now because the servo is not available.")
+                return True
+            threading.Thread(target=self.servo.look_down, daemon=True).start()
+            self.speak("Looking down.")
+            return True
+
+        if "look center" in lowered or "look straight" in lowered:
+            if not self.servo_enabled or not self.servo:
+                self.speak("I cannot move my head right now because the servo is not available.")
+                return True
+            threading.Thread(target=self.servo.look_center, daemon=True).start()
+            self.speak("Looking straight ahead.")
+            return True
+
+        return False
 
     def _probe_local_vision_stack(self) -> bool:
         if os.getenv("BUDDY_DISABLE_LOCAL_VISION", "0") == "1":
@@ -1269,16 +1393,22 @@ class BuddyIntegratedPi:
             self._stop_follow_mode()
             return
 
-        # 2. Move
+        # 2. Servo
+        if self._handle_servo_command(lowered):
+            return
+
+        # 3. Move
         movement = self._parse_movement(lowered)
         if movement is not None:
             self.follow_mode = False
             cmd, duration = movement
+            if not self._movement_allowed(cmd):
+                return
             self.motors.move(cmd, duration)
             self.speak(self._MOTOR_CONFIRMATIONS.get(cmd, "On it."))
             return
 
-        # 3. Sleep
+        # 4. Sleep
         if any(phrase in lowered for phrase in self._SLEEP_PHRASES):
             self.speak("Going to sleep. Say hey buddy to wake me up.")
             self._wait_for_tts()
@@ -1286,7 +1416,7 @@ class BuddyIntegratedPi:
             self._eye(EyeState.SLEEPING)
             return
 
-        # 4. Register face
+        # 5. Register face
         if any(p in lowered for p in ("register my face", "register face", "add my face", "save my face")):
             self.speak("Sure! What's your name?")
             self._wait_for_tts()
@@ -1498,7 +1628,7 @@ class BuddyIntegratedPi:
         return cmd, duration
 
     def _apply_emotion(self, emotion: str):
-        """Set OLED eye, servo position and motor animation from emotion string."""
+        """Set OLED eye and motor animation from emotion string."""
         entry = self._EMOTION_MAP.get(emotion.lower().strip())
         if not entry:
             return
@@ -1507,15 +1637,7 @@ class BuddyIntegratedPi:
 
         self._eye(eye_state)
 
-        if servo_action and hasattr(self, "servo") and self.servo and getattr(self, "servo_enabled", False):
-            if servo_action == "up":
-                threading.Thread(target=self.servo.look_up, daemon=True).start()
-            elif servo_action == "down":
-                threading.Thread(target=self.servo.look_down, daemon=True).start()
-            elif servo_action == "center":
-                threading.Thread(target=self.servo.look_center, daemon=True).start()
-
-        if motor_cmd and self.motors.is_connected():
+        if motor_cmd and self.motors.is_connected() and self._movement_allowed(motor_cmd, announce=False):
             threading.Timer(0.3, lambda e=motor_cmd: self.motors.emotion_move(e)).start()
 
     def _display_response(self, response: dict):
@@ -1533,7 +1655,8 @@ class BuddyIntegratedPi:
         }
         if intent in _brain_move:
             cmd = _brain_move[intent]
-            self.motors.move(cmd, None if cmd == "S" else 1.5)
+            if self._movement_allowed(cmd):
+                self.motors.move(cmd, None if cmd == "S" else 1.5)
         elif intent == "stop":
             self.motors.stop()
         if emotion:
@@ -1591,7 +1714,13 @@ class BuddyIntegratedPi:
                     2,
                 )
 
-        if self.follow_mode:
+        if self._ultrasonic_blocked:
+            distance_cm = int(self._ultrasonic_distance_m * 100) if self._ultrasonic_distance_m is not None else None
+            if distance_cm is None:
+                status = "Obstacle too close"
+            else:
+                status = f"Obstacle too close: {distance_cm} cm"
+        elif self.follow_mode:
             status = "Follow mode active"
         else:
             status = f"Chatting with: {self.active_user}" if self.active_user else "Looking for people..."
@@ -1721,6 +1850,9 @@ class BuddyIntegratedPi:
         if not self.motors.is_connected():
             self.speak("I cannot follow right now because the motors are not connected.")
             return
+        if self._ultrasonic_blocked:
+            self._announce_proximity_stop(force=True)
+            return
         self.follow_mode = True
         self._follow_last_command = "S"
         self._follow_last_command_time = 0.0
@@ -1765,6 +1897,8 @@ class BuddyIntegratedPi:
         now = time.time()
         if cmd == self._follow_last_command and (now - self._follow_last_command_time) < self._FOLLOW_COMMAND_INTERVAL:
             return
+        if not self._movement_allowed(cmd):
+            return
         self._follow_last_command = cmd
         self._follow_last_command_time = now
         if cmd == "S":
@@ -1778,6 +1912,9 @@ class BuddyIntegratedPi:
         if not self.motors.is_connected():
             self.follow_mode = False
             self.motors.stop()
+            return
+        if self._ultrasonic_blocked:
+            self._send_follow_command("S")
             return
 
         target = self._get_follow_target(frame)
@@ -2208,7 +2345,6 @@ class BuddyIntegratedPi:
                 self._update_bbox_fall_monitor(frame)
                 self._update_blood_monitor(frame)
                 self._update_follow_mode(frame)
-                self._update_servo_face_tracking(frame)
                 self._update_eye_tracking(frame)
 
             # pose-based behavior pipeline every 3rd frame
@@ -2438,6 +2574,13 @@ class BuddyIntegratedPi:
             self.motors.cleanup()
         except Exception:
             pass
+        if self._ultrasonic_sensor is not None:
+            try:
+                self._ultrasonic_sensor.close()
+            except Exception:
+                pass
+            finally:
+                self._ultrasonic_sensor = None
         if self.servo_enabled and self.servo:
             try:
                 self.servo.cleanup()

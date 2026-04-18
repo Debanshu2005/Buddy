@@ -31,3 +31,4 @@ Thumbs.db
 *.mp4
 *.wav
 test.*
+pi_services/pi_runtime/buddy_update_integrated_response_watch_copy.py
