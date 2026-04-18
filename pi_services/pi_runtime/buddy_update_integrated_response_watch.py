@@ -232,6 +232,7 @@ class BuddyIntegratedPi:
         self._last_logged_objects: tuple[str, ...] = ()
         self._thinking_token: Optional[str] = None
         self._camera_thread: Optional[threading.Thread] = None
+        self._keyboard_thread: Optional[threading.Thread] = None
         self._notif_queue: list[dict] = []
         self._notif_lock = threading.Lock()
         self.local_vision_enabled = False
@@ -2276,6 +2277,50 @@ class BuddyIntegratedPi:
         time.sleep(1.0)
         self.speak("Hey. I am Buddy. Call me anytime.")
 
+    def _handle_typed_input(self, text: str):
+        """Process terminal input through the same command path as speech."""
+        normalized = self._normalize_heard_text(text)
+        if not normalized:
+            return
+
+        if normalized in ("quit", "exit"):
+            self.speak("Shutting down.")
+            self.cleanup()
+            return
+
+        if self.sleep_mode and self._heard_wake_word(normalized):
+            self.sleep_mode = False
+            self._eye(EyeState.WAKING)
+            self.speak("I am awake. What can I do for you?")
+            self._wait_for_tts()
+            return
+
+        self._process_input(text)
+
+    def _keyboard_loop(self):
+        """Allow typed interaction from the terminal alongside voice input."""
+        while self.running:
+            try:
+                text = input("\nYou> ").strip()
+            except EOFError:
+                time.sleep(0.2)
+                continue
+            except Exception as exc:
+                self.logger.warning("Keyboard input failed: %s", exc)
+                time.sleep(0.5)
+                continue
+
+            if not text:
+                continue
+            print(f"[Typed] {text}")
+            self._handle_typed_input(text)
+
+    def _start_keyboard_listener(self):
+        if self._keyboard_thread and self._keyboard_thread.is_alive():
+            return
+        self._keyboard_thread = threading.Thread(target=self._keyboard_loop, daemon=True)
+        self._keyboard_thread.start()
+
     def _wake_loop(self):
         print("Waiting for 'Buddy'...")
         while self.running and not self.sleep_mode:
@@ -2361,10 +2406,12 @@ class BuddyIntegratedPi:
     def run(self):
         self.running = True
         print("[Safety] Passive camera and emergency-phrase detection enabled. Wake word is not required for alerts.")
+        print("[Input] You can also type commands like 'follow me', 'stop following', or 'exit'.")
         self._start_phone_listener()
         self._start_stream_server(port=8090)
         self._camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
         self._camera_thread.start()
+        self._start_keyboard_listener()
         threading.Thread(target=self._startup_greeting, daemon=True).start()
         time.sleep(0.5)
         self._wake_loop()
