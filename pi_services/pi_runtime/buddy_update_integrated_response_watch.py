@@ -1524,6 +1524,87 @@ class BuddyIntegratedPi:
         if not self.is_speaking:
             self.speak("Path is clear.")
 
+    def _person_or_face_visible(self) -> bool:
+        if self.last_faces:
+            return True
+        return any(
+            isinstance(det, dict) and det.get("name") == "person"
+            for det in self.current_detections
+        )
+
+    def _update_behavior_monitor(self, frame: np.ndarray):
+        if os.getenv("BUDDY_ENABLE_VISUAL_SAFETY", "1") == "0":
+            return
+        if self.sleep_mode or self._emergency_active:
+            return
+
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
+        except Exception as exc:
+            self.logger.warning("Behavior monitor frame prep failed: %s", exc)
+            return
+
+        if self._previous_behavior_frame is None:
+            self._previous_behavior_frame = gray
+            self._last_motion_time = time.time()
+            return
+
+        diff = cv2.absdiff(self._previous_behavior_frame, gray)
+        motion_score = float(np.mean(diff))
+        self._previous_behavior_frame = gray
+
+        if motion_score >= float(os.getenv("BUDDY_VISUAL_MOTION_THRESHOLD", self._VISUAL_MOTION_THRESHOLD)):
+            self._last_motion_time = time.time()
+
+        if not self._person_or_face_visible():
+            self._last_motion_time = time.time()
+            return
+
+        now = time.time()
+        still_for = now - self._last_motion_time
+        stillness_limit = float(os.getenv("BUDDY_VISUAL_STILLNESS_SECONDS", self._VISUAL_STILLNESS_SECONDS))
+        cooldown = float(os.getenv("BUDDY_VISUAL_CHECK_COOLDOWN_SECONDS", self._VISUAL_CHECK_COOLDOWN_SECONDS))
+
+        if still_for < stillness_limit:
+            return
+        if self._visual_check_active or (now - self._last_visual_check_time) < cooldown:
+            return
+
+        reason = f"Person or face visible with very little movement for {still_for:.0f} seconds"
+        self._visual_check_active = True
+        self._last_visual_check_time = now
+        threading.Thread(
+            target=self._visual_wellness_check,
+            args=(reason,),
+            daemon=True,
+        ).start()
+
+    def _visual_wellness_check(self, reason: str):
+        self._pause_wake_listening = True
+        try:
+            self.logger.warning("Visual safety check: %s", reason)
+            self.speak("I have not seen you move for a while. Are you okay?")
+            self._wait_for_tts()
+            self._play_listen_beep()
+            self._eye(EyeState.LISTENING)
+            answer = self.listen_for_speech_with_initial_timeout(10.0)
+            self._eye(EyeState.IDLE)
+
+            if answer and self._is_ok_response(answer):
+                self.speak("Okay. I am glad you are alright.")
+                self._last_motion_time = time.time()
+                return
+
+            if not answer or self._is_not_ok_response(answer):
+                self._trigger_emergency_response(answer or reason)
+                return
+
+            self.speak("I am not sure I understood. I will stay alert. If you need help, say emergency.")
+        finally:
+            self._visual_check_active = False
+            self._pause_wake_listening = False
+
     def _start_stream_server(self, port: int = 8080):
         buddy = self
 
@@ -1597,6 +1678,9 @@ class BuddyIntegratedPi:
             else:
                 processed = frame
 
+            if self.frame_count % 10 == 0:
+                self._update_behavior_monitor(frame)
+
             ok, buf = cv2.imencode(".jpg", processed, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 with self._stream_lock:
@@ -1616,6 +1700,8 @@ class BuddyIntegratedPi:
         print(f"[Vosk] Listening on {self.arecord_device}...")
         try:
             while self.running:
+                if self._pause_wake_listening:
+                    return False
                 raw = proc.stdout.read(8000)
                 if not raw:
                     print("[Vosk] arecord stream ended")
@@ -1646,6 +1732,9 @@ class BuddyIntegratedPi:
     def _wake_loop(self):
         print("Waiting for 'Buddy'...")
         while self.running and not self.sleep_mode:
+            if self._pause_wake_listening:
+                time.sleep(0.1)
+                continue
             if _vosk_available:
                 detected = self._vosk_listen_for_wake_word()
             else:
