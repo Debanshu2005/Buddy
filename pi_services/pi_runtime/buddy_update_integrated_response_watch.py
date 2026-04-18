@@ -1688,74 +1688,37 @@ class BuddyIntegratedPi:
             self._wait_for_tts()
 
     def _do_scan_then_save(self, name: str):
-        """Multi-angle face scan then save under name. Falls back to normal conversation on failure."""
-        poses = [
-            ("front", "Great! Now slowly turn your face to the LEFT and hold it there."),
-            ("left",  "Perfect! Now turn your face to the RIGHT and hold it there."),
-            ("right", "Good! Now tilt your face slightly UP and hold it there."),
-            ("up",    "Almost done! Now tilt your face slightly DOWN and hold it there."),
-            ("down",  None),
-        ]
-        total_angles = len(poses)
-        failed_angles = 0
-
-        for i, (angle, next_instruction) in enumerate(poses):
-            print(f"[Registration] Angle {i+1}/{total_angles}: {angle.upper()} — waiting 5s...")
-            time.sleep(5.0)
-            print(f"[Registration] Capturing {angle} angle for {name}...")
-            captured = False
-
-            for attempt in range(30):
-                if self.last_frame is None:
-                    time.sleep(0.1)
-                    continue
-                faces = self.detector.detect(self.last_frame)
-                if not faces:
-                    if attempt == 10:
-                        print(f"[Registration] No face — asking to stay still")
-                        self.speak("Please stay still, I can't see your face.")
-                    elif attempt == 20:
-                        print(f"[Registration] Still no face — trying again")
-                        self.speak("Can't capture, trying again.")
-                    time.sleep(0.1)
-                    continue
-                x, y, w, h = self.detector.get_largest_face(faces)
-                if w <= 80 or h <= 80:
-                    print(f"[Registration] Face too small ({w}x{h}), retrying...")
-                    time.sleep(0.1)
-                    continue
-                face_roi = self.last_frame[y:y + h, x:x + w]
-                if self.recognizer.add_face(name, face_roi, angle):
-                    print(f"[Registration] ✅ Captured {angle} angle for {name}")
-                    captured = True
-                    break
+        """Single front-facing scan then save. Simple and fast."""
+        print(f"[Registration] Scanning front face for {name}...")
+        captured = False
+        for attempt in range(40):
+            if self.last_frame is None:
                 time.sleep(0.1)
+                continue
+            faces = self.detector.detect(self.last_frame)
+            if not faces:
+                if attempt == 15:
+                    self.speak("Please look straight at the camera.")
+                time.sleep(0.1)
+                continue
+            x, y, w, h = self.detector.get_largest_face(faces)
+            if w <= 80 or h <= 80:
+                time.sleep(0.1)
+                continue
+            face_roi = self.last_frame[y:y + h, x:x + w]
+            if self.recognizer.add_face(name, face_roi, "front"):
+                print(f"[Registration] ✅ Face captured for {name}")
+                captured = True
+                break
+            time.sleep(0.1)
 
-            if not captured:
-                failed_angles += 1
-                print(f"[Registration] ⚠️ Failed to capture {angle} angle for {name} (failures so far: {failed_angles})")
-                self.logger.warning("Could not capture %s angle for %s", angle, name)
-                if failed_angles >= 3:
-                    print(f"[Registration] ❌ Too many failures — saving name+password only")
-                    self.speak("I'm having trouble scanning your face. I've saved your name and password. You can use your password to identify yourself next time.")
-                    self._wait_for_tts()
-                    try:
-                        from memory.pi_memory import delete_person
-                        delete_person(name)
-                        self.recognizer.known_faces.pop(name, None)
-                        print(f"[Registration] Cleaned up partial face data for {name} — password kept")
-                    except Exception:
-                        pass
-                    return
-
-            if next_instruction:
-                self.speak(next_instruction)
-                self._wait_for_tts()
-
-        print(f"[Registration] All angles done for {name}. Saving to DB...")
-        total = len(self.recognizer.known_faces.get(name, []))
-        print(f"[Registration] ✅ {name} saved with {total} embeddings in DB")
-        self.speak(f"Done! I've saved your face {name}. I'll recognize you next time.")
+        if captured:
+            total = len(self.recognizer.known_faces.get(name, []))
+            print(f"[Registration] ✅ {name} saved with {total} embeddings")
+            self.speak(f"Done! I've saved your face {name}. I'll recognize you next time.")
+        else:
+            print(f"[Registration] ⚠️ Could not capture face for {name} — password saved")
+            self.speak(f"I couldn't scan your face clearly {name}, but your password is saved. You can use it to identify yourself.")
         self._wait_for_tts()
 
     def _is_stop_command(self, text: str) -> bool:
