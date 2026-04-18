@@ -186,6 +186,14 @@ class RuntimeSettings:
     display_enabled: bool = os.getenv("BUDDY_ENABLE_DISPLAY", "1") != "0"
     pc_camera_ip: str = os.getenv("BUDDY_PC_CAMERA_IP", "buddypc.local")
     pc_camera_port: int = 5000
+    surveillance_enabled: bool = os.getenv("BUDDY_ENABLE_SURVEILLANCE", "0") == "1"
+    surveillance_port: int = int(os.getenv("BUDDY_SURVEILLANCE_PORT", "8001"))
+    surveillance_cooldown: float = float(os.getenv("BUDDY_SURVEILLANCE_COOLDOWN", "120.0"))
+    ultrasonic_enabled: bool = os.getenv("BUDDY_ENABLE_ULTRASONIC", "0") == "1"
+    ultrasonic_trigger_pin: int = int(os.getenv("BUDDY_ULTRASONIC_TRIGGER_PIN", "23"))
+    ultrasonic_echo_pin: int = int(os.getenv("BUDDY_ULTRASONIC_ECHO_PIN", "24"))
+    ultrasonic_stop_distance_m: float = float(os.getenv("BUDDY_ULTRASONIC_STOP_DISTANCE_M", "0.28"))
+    ultrasonic_max_distance_m: float = float(os.getenv("BUDDY_ULTRASONIC_MAX_DISTANCE_M", "2.0"))
 
 
 class BuddyIntegratedPi:
