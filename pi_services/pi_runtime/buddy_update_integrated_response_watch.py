@@ -50,10 +50,21 @@ from hardware.motor_controller import MotorController
 from hardware.oled_eyes import OledEyes, EyeState
 from memory.pi_memory import delete_person
 from phone_link.core import process_notification
+from vision.behavior.pipeline import BehaviorDetectionPipeline, PipelineConfig
+from vision.behavior.whatsapp_alert import send_whatsapp_alert
 
 os.environ["LIBCAMERA_LOG_LEVELS"] = "*:ERROR"
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+
+try:
+    from dotenv import load_dotenv
+    _env_path = ROOT_DIR / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+        print(f"[Config] Loaded .env from {_env_path}")
+except ImportError:
+    pass
 
 _VOSK_MODEL_PATH = str(ROOT_DIR / "vosk-model-small-en-us-0.15")
 _vosk_model = None
@@ -207,6 +218,18 @@ class BuddyIntegratedPi:
         self._visual_check_active = False
         self._pause_wake_listening = False
         self._load_response_time_stats()
+
+        # behavior pipeline
+        self._behavior_pipeline = BehaviorDetectionPipeline(
+            config=PipelineConfig(
+                resize_width=224,
+                resize_height=224,
+                process_every_n_frames=3,
+                sequence_length=12,
+                enable_visualization=False,
+            ),
+            alert_callback=self._on_behavior_alert,
+        )
 
         self.aplay_device, self.usb_card_index = self._find_output_audio_device()
         self.arecord_device = self._find_input_audio_device()
@@ -849,31 +872,26 @@ class BuddyIntegratedPi:
         print(f"[EMERGENCY] {message}")
         self.speak("I am contacting your emergency contacts now.")
 
-        contacts = [
-            item.strip()
-            for item in os.getenv("BUDDY_EMERGENCY_CONTACTS", "").split(",")
-            if item.strip()
-        ]
-        if contacts:
-            print(f"[EMERGENCY] Contacts to notify: {', '.join(contacts)}")
-        else:
-            print("[EMERGENCY] No BUDDY_EMERGENCY_CONTACTS configured.")
+        jpeg_bytes = None
+        with self._stream_lock:
+            jpeg_bytes = self._stream_frame
 
-        whatsapp_numbers = self._get_whatsapp_family_numbers()
-        if whatsapp_numbers:
-            threading.Thread(
-                target=self._send_whatsapp_family_alert,
-                args=(message, reason, whatsapp_numbers),
-                daemon=True,
-            ).start()
-        else:
-            print("[EMERGENCY] No BUDDY_FAMILY_WHATSAPP_NUMBERS configured.")
+        threading.Thread(
+            target=send_whatsapp_alert,
+            kwargs={
+                "label": "emergency",
+                "severity": "critical",
+                "reason": message,
+                "jpeg_bytes": jpeg_bytes,
+            },
+            daemon=True,
+        ).start()
 
         webhook_url = os.getenv("BUDDY_EMERGENCY_WEBHOOK_URL", "").strip()
         if webhook_url:
             threading.Thread(
                 target=self._send_emergency_webhook,
-                args=(webhook_url, message, contacts),
+                args=(webhook_url, message, []),
                 daemon=True,
             ).start()
 
@@ -1516,6 +1534,33 @@ class BuddyIntegratedPi:
             self._display_response(response)
             self._wait_for_tts()
 
+    def _on_behavior_alert(self, result: dict):
+        """Called by behavior pipeline on risk detection — speaks alert and sends WhatsApp."""
+        decision = result.get("decision", {})
+        label = decision.get("label", "unknown")
+        severity = decision.get("severity", "low")
+        reason = decision.get("reason", "")
+        print(f"[Behavior] 🚨 ALERT: {label} | {severity} | {reason}")
+
+        jpeg_bytes = None
+        with self._stream_lock:
+            jpeg_bytes = self._stream_frame
+
+        if not self.is_speaking:
+            msg = {
+                "fall_detected": "Warning! Someone may have fallen!",
+                "possible_medical_emergency": "Emergency! Someone may need medical help!",
+                "injury_suspected": "Alert! Someone appears to be injured.",
+                "monitor_closely": "Someone has been inactive for a while.",
+            }.get(label, f"Behavior alert: {label}")
+            self.speak(msg)
+
+        threading.Thread(
+            target=send_whatsapp_alert,
+            kwargs={"label": label, "severity": severity, "reason": reason, "jpeg_bytes": jpeg_bytes},
+            daemon=True,
+        ).start()
+
     def _on_obstacle(self):
         if not self.is_speaking:
             self.speak("Obstacle detected. I have stopped.")
@@ -1680,6 +1725,17 @@ class BuddyIntegratedPi:
 
             if self.frame_count % 10 == 0:
                 self._update_behavior_monitor(frame)
+
+            # pose-based behavior pipeline every 3rd frame
+            if self.frame_count % 3 == 0:
+                try:
+                    result = self._behavior_pipeline.process_frame(frame)
+                    if result.get("frame_processed") and result.get("person_detected"):
+                        decision = result.get("decision", {})
+                        if decision.get("label") not in ("normal", None):
+                            print(f"[Behavior] {decision.get('label')} | {decision.get('severity')} | {decision.get('reason')}")
+                except Exception as exc:
+                    self.logger.warning("Behavior pipeline error: %s", exc)
 
             ok, buf = cv2.imencode(".jpg", processed, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
