@@ -218,6 +218,8 @@ class BuddyIntegratedPi:
         self._visual_check_active = False
         self._pause_wake_listening = False
         self._load_response_time_stats()
+        self.servo = None
+        self.servo_enabled = False
 
         # behavior pipeline
         self._behavior_pipeline = BehaviorDetectionPipeline(
@@ -246,6 +248,7 @@ class BuddyIntegratedPi:
         )
         self.motors.set_obstacle_callback(self._on_obstacle)
         self.motors.set_clear_callback(self._on_clear_path)
+        self._init_servo()
 
         self.tts_voice = "en-IN-NeerjaNeural"
         self.speech_enabled = True
@@ -263,6 +266,23 @@ class BuddyIntegratedPi:
             level=getattr(logging, self.config.log_level, logging.INFO),
             format=self.config.log_format,
         )
+
+    def _init_servo(self):
+        if not self.settings.use_servo or os.getenv("BUDDY_ENABLE_SERVO", "1") == "0":
+            self.logger.info("Servo disabled by settings")
+            return
+        try:
+            from hardware.servo_controller import ServoController
+            self.servo = ServoController()
+            self.servo_enabled = bool(getattr(self.servo, "_pwm", None))
+            if self.servo_enabled:
+                self.logger.info("Servo initialized")
+            else:
+                self.logger.warning("Servo controller loaded but PWM is unavailable")
+        except Exception as exc:
+            self.servo = None
+            self.servo_enabled = False
+            self.logger.warning("Servo unavailable: %s", exc)
 
     def _probe_local_vision_stack(self) -> bool:
         if os.getenv("BUDDY_DISABLE_LOCAL_VISION", "0") == "1":
@@ -1883,6 +1903,13 @@ class BuddyIntegratedPi:
             self.motors.cleanup()
         except Exception:
             pass
+        if self.servo_enabled and self.servo:
+            try:
+                self.servo.cleanup()
+            except Exception:
+                pass
+            finally:
+                self.servo_enabled = False
         self._pc_stream_active = False
         if self.cap is not None:
             try:
