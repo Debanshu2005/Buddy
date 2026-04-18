@@ -2574,12 +2574,8 @@ class BuddyIntegratedPi:
                     continue
                 if rec.AcceptWaveform(raw):
                     text = json.loads(rec.Result()).get("text", "").lower()
-                    if text:
-                        print(f"[Vosk] Final: '{text}'")
                 else:
                     text = json.loads(rec.PartialResult()).get("partial", "").lower()
-                    if text:
-                        print(f"[Vosk] Partial: '{text}'")
                 if not text:
                     continue
                 normalized = self._normalize_heard_text(text)
