@@ -80,7 +80,7 @@ except Exception as _e:
 
 @dataclass
 class RuntimeSettings:
-    stt_server_ip: str = "buddypc.local"
+    stt_server_ip: str = os.getenv("BUDDY_STT_SERVER_IP", "buddypc.local")
     stt_port: int = int(os.getenv("BUDDY_STT_PORT", "8765"))
     notification_port: int = int(os.getenv("BUDDY_NOTIFICATION_PORT", "8001"))
     arduino_port: str = os.getenv("BUDDY_ARDUINO_PORT", "/dev/ttyUSB0")
@@ -90,12 +90,19 @@ class RuntimeSettings:
     object_interval_frames: int = 20
     face_interval_frames: int = 15
     display_enabled: bool = os.getenv("BUDDY_ENABLE_DISPLAY", "1") != "0"
-    pc_camera_ip: str = "buddypc.local"
+    pc_camera_ip: str = os.getenv("BUDDY_PC_CAMERA_IP", "buddypc.local")
     pc_camera_port: int = 5000
 
 
 class BuddyIntegratedPi:
-    _WAKE_WORDS = ("buddy", "hey buddy", "hi buddy")
+    _WAKE_WORDS = (
+        "buddy",
+        "hey buddy",
+        "hi buddy",
+        "buddy wake up",
+        "hey buddy wake up",
+        "wake up buddy",
+    )
     _SLEEP_PHRASES = ("go to sleep", "sleep now", "take a nap", "good night")
     _STOP_WORDS = ("stop", "halt", "freeze", "don't move", "do not move")
     _DIR_MAP = {
@@ -895,6 +902,28 @@ class BuddyIntegratedPi:
     def _is_emergency_phrase(self, text: str) -> bool:
         lowered = text.lower().strip()
         return any(phrase in lowered for phrase in self._EMERGENCY_PHRASES)
+
+    def _normalize_heard_text(self, text: str) -> str:
+        """Normalize recognition text before matching wake/emergency phrases."""
+        lowered = text.lower().strip()
+        lowered = re.sub(r"[^a-z0-9\s]", " ", lowered)
+        lowered = re.sub(r"\s+", " ", lowered).strip()
+        return lowered
+
+    def _heard_wake_word(self, text: str) -> bool:
+        """Return True when a wake phrase or common close variant is recognized."""
+        normalized = self._normalize_heard_text(text)
+        if not normalized:
+            return False
+        if any(phrase in normalized for phrase in self._WAKE_WORDS):
+            return True
+
+        tokens = normalized.split()
+        if "buddy" in tokens:
+            return True
+
+        common_variants = ("budy", "baddi", "body", "buddhi")
+        return any(token in common_variants for token in tokens)
 
     def _handle_passive_emergency_phrase(self, source: str, text: str):
         self.follow_mode = False
@@ -2200,11 +2229,12 @@ class BuddyIntegratedPi:
                         print(f"[Vosk] Partial: '{text}'")
                 if not text:
                     continue
-                if self._is_emergency_phrase(text):
+                normalized = self._normalize_heard_text(text)
+                if self._is_emergency_phrase(normalized):
                     emergency_text = text
                     print(f"[Vosk] Emergency phrase: '{text}'")
                     break
-                if any(w in text for w in self._WAKE_WORDS):
+                if self._heard_wake_word(normalized):
                     wake_detected = True
                     print(f"Wake word: '{text}'")
                     break
@@ -2232,11 +2262,11 @@ class BuddyIntegratedPi:
                 detected = self._vosk_listen_for_wake_word()
             else:
                 text = self.listen_for_speech()
-                lowered = text.lower() if text else ""
+                lowered = self._normalize_heard_text(text) if text else ""
                 if lowered and self._is_emergency_phrase(lowered):
                     self._handle_passive_emergency_phrase("STT", lowered)
                     continue
-                detected = bool(lowered) and any(w in lowered for w in self._WAKE_WORDS)
+                detected = self._heard_wake_word(lowered)
 
             if not detected:
                 continue
@@ -2287,11 +2317,11 @@ class BuddyIntegratedPi:
                         break
                 else:
                     text = self.listen_for_speech()
-                    lowered = text.lower() if text else ""
+                    lowered = self._normalize_heard_text(text) if text else ""
                     if lowered and self._is_emergency_phrase(lowered):
                         self._handle_passive_emergency_phrase("STT", lowered)
                         continue
-                    if lowered and any(w in lowered for w in self._WAKE_WORDS):
+                    if self._heard_wake_word(lowered):
                         self.sleep_mode = False
                         self._eye(EyeState.WAKING)
                         self.speak("I am awake. What can I do for you?")
