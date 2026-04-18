@@ -18,6 +18,7 @@ except ImportError:
     pass
 
 _LOCAL_FACES_FILE = Path(__file__).resolve().parent / "faces_local.json"
+_LOCAL_PASSWORDS_FILE = Path(__file__).resolve().parent / "passwords_local.json"
 
 
 def _load_local() -> dict:
@@ -34,6 +35,138 @@ def _save_local(data: dict):
         _LOCAL_FACES_FILE.write_text(json.dumps(data))
     except Exception as e:
         print(f"Local save error: {e}")
+
+
+def _load_passwords() -> dict:
+    """Load passwords from local file (mirrors what's in DB)."""
+    if _LOCAL_PASSWORDS_FILE.exists():
+        try:
+            return json.loads(_LOCAL_PASSWORDS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_passwords_local(data: dict):
+    try:
+        _LOCAL_PASSWORDS_FILE.write_text(json.dumps(data))
+    except Exception as e:
+        print(f"Password local save error: {e}")
+
+
+def save_password(name: str, password: str) -> bool:
+    """Save password in DB faces table as name__password key, with local fallback."""
+    key = f"{name}__password"
+    pw = password.lower().strip()
+
+    # save locally always
+    local = _load_passwords()
+    local[name.lower()] = pw
+    _save_passwords_local(local)
+    print(f"\u2705 Password saved locally for {name}")
+
+    # save to DB in faces table using password as a JSON string
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO faces (name, embedding) VALUES (%s, %s) "
+            "ON CONFLICT (name) DO UPDATE SET embedding = %s",
+            (key, json.dumps(pw), json.dumps(pw))
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"\u2705 Password saved to DB for {name}")
+    except Exception as e:
+        print(f"DB password save skipped (using local): {e}")
+
+    return True
+
+
+def verify_password(name: str, password: str) -> bool:
+    """Check password against DB first, then local fallback."""
+    pw = password.lower().strip()
+    key = f"{name}__password"
+
+    # try DB
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT embedding FROM faces WHERE name = %s", (key,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            stored = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            return stored == pw
+    except Exception:
+        pass
+
+    # fallback to local
+    local = _load_passwords()
+    return local.get(name.lower()) == pw
+
+
+def find_name_by_password(password: str) -> Optional[str]:
+    """Find name by password — checks DB first, then local."""
+    pw = password.lower().strip()
+
+    # try DB
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM faces WHERE name LIKE %s", ("%__password",))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        for (key,) in rows:
+            stored_raw = None
+            try:
+                conn2 = get_db_connection()
+                cur2 = conn2.cursor()
+                cur2.execute("SELECT embedding FROM faces WHERE name = %s", (key,))
+                r = cur2.fetchone()
+                cur2.close()
+                conn2.close()
+                if r:
+                    stored_raw = json.loads(r[0]) if isinstance(r[0], str) else r[0]
+            except Exception:
+                pass
+            if stored_raw == pw:
+                return key.replace("__password", "").title()
+    except Exception:
+        pass
+
+    # fallback to local
+    local = _load_passwords()
+    for name, stored in local.items():
+        if stored == pw:
+            return name.title()
+    return None
+
+
+def get_all_names_with_passwords() -> list:
+    """Return all names that have a password registered."""
+    names = set()
+
+    # try DB
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM faces WHERE name LIKE %s", ("%__password",))
+        for (key,) in cur.fetchall():
+            names.add(key.replace("__password", ""))
+        cur.close()
+        conn.close()
+    except Exception:
+        pass
+
+    # merge local
+    for name in _load_passwords():
+        names.add(name)
+
+    return list(names)
 
 
 def get_db_connection():
