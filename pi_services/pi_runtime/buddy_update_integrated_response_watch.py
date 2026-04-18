@@ -2717,12 +2717,18 @@ class BuddyIntegratedPi:
 
             # Only run wellness checks when we actually got speech
             if user_text:
-                if not self._check_response_delay_and_confirm(response_elapsed):
-                    self._wait_for_tts()
-                    continue
-                if not self._check_weak_voice_and_confirm(voice_stats):
-                    self._wait_for_tts()
-                    continue
+                _skip = any(p in user_text.lower() for p in (
+                    "register my face", "register face", "add my face", "save my face",
+                    "do you know me", "who am i", "do you recognize me", "recognize me",
+                    "do you remember me", "remember me", "have we met",
+                ))
+                if not _skip:
+                    if not self._check_response_delay_and_confirm(response_elapsed):
+                        self._wait_for_tts()
+                        continue
+                    if not self._check_weak_voice_and_confirm(voice_stats):
+                        self._wait_for_tts()
+                        continue
                 self._record_response_time(response_elapsed)
                 self._record_voice_stats(voice_stats)
                 self._process_input(user_text)
