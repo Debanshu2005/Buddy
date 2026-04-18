@@ -78,8 +78,8 @@ class RuntimeSettings:
     object_interval_frames: int = 20
     face_interval_frames: int = 15
     display_enabled: bool = os.getenv("BUDDY_ENABLE_DISPLAY", "1") != "0"
-    pc_camera_ip: str = os.getenv("BUDDY_PC_CAMERA_IP", "10.32.50.62")
-    pc_camera_port: int = int(os.getenv("BUDDY_PC_CAMERA_PORT", "5000"))
+    pc_camera_ip: str = "buddypc.local"
+    pc_camera_port: int = 5000
 
 
 class BuddyIntegratedPi:
@@ -726,20 +726,35 @@ class BuddyIntegratedPi:
             if name_text:
                 name = self._extract_name(name_text)
                 if not name:
-                    # treat the whole utterance as the name if no phrase matched
                     words = [w.strip(".,!?") for w in name_text.split() if w.isalpha() and len(w) > 1]
                     name = words[0].title() if words else ""
             else:
                 name = ""
-            if name:
-                print(f"[Registration] Name heard: {name}")
-                self.active_user = name
-                self.speak(f"Nice to meet you {name}! I'll scan your face from different angles. Please look straight at me and hold still.")
-                self._wait_for_tts()
-                threading.Thread(target=self._do_scan_then_save, args=(name,), daemon=True).start()
-            else:
+            if not name:
                 print("[Registration] Could not get name")
                 self.speak("Sorry, I didn't catch your name. Please try again.")
+                return
+            print(f"[Registration] Name heard: {name}")
+
+            self.speak(f"Got it {name}! Now please set a password. Say any word or phrase you will remember.")
+            self._wait_for_tts()
+            time.sleep(0.1)
+            print("[Registration] Listening for password...")
+            self._play_listen_beep()
+            password_text = self.listen_for_speech()
+            if not password_text:
+                print("[Registration] Could not get password")
+                self.speak("Sorry, I didn't catch your password. Please try again.")
+                return
+            password = password_text.lower().strip()
+            print(f"[Registration] Password heard: '{password}'")
+            from memory.pi_memory import save_password
+            save_password(name, password)
+
+            self.active_user = name
+            self.speak(f"Password set! Now I'll scan your face from different angles. Please look straight at me and hold still.")
+            self._wait_for_tts()
+            threading.Thread(target=self._do_scan_then_save, args=(name,), daemon=True).start()
             return
 
         # 6. Identity check — single scan
@@ -760,37 +775,66 @@ class BuddyIntegratedPi:
         self._display_response(response)
 
     def _check_and_greet_face(self):
-        """Single face scan — greet if known, say unknown if not."""
-        if not self.local_vision_enabled or self.detector is None or self.recognizer is None:
-            self.speak("I can't see right now.")
+        """Face scan first. If fails, fall back to password."""
+        from memory.pi_memory import find_name_by_password, get_all_names_with_passwords
+
+        # step 1: try face recognition
+        if self.local_vision_enabled and self.detector is not None and self.recognizer is not None:
+            print("[Face check] Reading frame...")
+            ok, frame = self._read_frame()
+            if not ok or frame is None:
+                frame = self.last_frame
+            if frame is not None:
+                print("[Face check] Detecting faces...")
+                faces = self.detector.detect(frame)
+                if faces:
+                    print(f"[Face check] {len(faces)} face(s) found, running recognition...")
+                    x, y, w, h = self.detector.get_largest_face(faces)
+                    face_roi = frame[y:y + h, x:x + w]
+                    name, confidence = self.recognizer.recognize(face_roi)
+                    print(f"[Face check] Result: {name} (confidence: {confidence:.2f})")
+                    if name != "Unknown" and confidence > 0.45:
+                        self.active_user = name
+                        print(f"[Face check] Match found: {name}")
+                        self.speak(f"Hi {name}! Good to see you.")
+                        self._wait_for_tts()
+                        return
+                    print(f"[Face check] No face match (confidence: {confidence:.2f}) — trying password")
+                else:
+                    print("[Face check] No faces found — trying password")
+            else:
+                print("[Face check] No frame — trying password")
+        else:
+            print("[Face check] Vision unavailable — trying password")
+
+        # step 2: password fallback
+        registered = get_all_names_with_passwords()
+        if not registered:
+            self.speak("I don't recognize you and no one is registered yet. Say register my face to get started.")
             return
-        print("[Face check] Reading frame...")
-        ok, frame = self._read_frame()
-        if not ok or frame is None:
-            frame = self.last_frame
-        if frame is None:
-            print("[Face check] No frame available")
-            self.speak("I can't see right now.")
+
+        self.speak("I couldn't recognize your face. Please say your password.")
+        self._wait_for_tts()
+        time.sleep(0.1)
+        print("[Password check] Listening for password...")
+        self._play_listen_beep()
+        password_text = self.listen_for_speech()
+        if not password_text:
+            print("[Password check] No password heard")
+            self.speak("Sorry, I didn't catch that. I don't know you.")
             return
-        print("[Face check] Detecting faces...")
-        faces = self.detector.detect(frame)
-        if not faces:
-            print("[Face check] No faces found")
-            self.speak("I don't see anyone in front of me.")
-            return
-        print(f"[Face check] {len(faces)} face(s) found, running recognition...")
-        x, y, w, h = self.detector.get_largest_face(faces)
-        face_roi = frame[y:y + h, x:x + w]
-        name, confidence = self.recognizer.recognize(face_roi)
-        print(f"[Face check] Result: {name} (confidence: {confidence:.2f})")
-        if name != "Unknown" and confidence > 0.45:
-            self.active_user = name
-            print(f"[Face check] Match found: {name} — speaking greeting")
-            self.speak(f"Hi {name}! Good to see you.")
+
+        password = password_text.lower().strip()
+        print(f"[Password check] Heard: '{password}'")
+        found_name = find_name_by_password(password)
+        if found_name:
+            self.active_user = found_name
+            print(f"[Password check] Password matched: {found_name}")
+            self.speak(f"Hi {found_name}! Good to see you.")
             self._wait_for_tts()
         else:
-            print(f"[Face check] No match (best confidence: {confidence:.2f}) — speaking unknown")
-            self.speak("I don't recognize you. Say register my face if you'd like me to remember you.")
+            print(f"[Password check] No match for: '{password}'")
+            self.speak("Sorry, I don't know you.")
             self._wait_for_tts()
 
     def _do_scan_then_save(self, name: str):
@@ -842,18 +886,16 @@ class BuddyIntegratedPi:
                 print(f"[Registration] ⚠️ Failed to capture {angle} angle for {name} (failures so far: {failed_angles})")
                 self.logger.warning("Could not capture %s angle for %s", angle, name)
                 if failed_angles >= 3:
-                    print(f"[Registration] ❌ Too many failures — falling back to default conversation")
-                    self.speak("I'm having trouble scanning your face. Falling back to default conversation. You can still talk to me normally.")
+                    print(f"[Registration] ❌ Too many failures — saving name+password only")
+                    self.speak("I'm having trouble scanning your face. I've saved your name and password. You can use your password to identify yourself next time.")
                     self._wait_for_tts()
-                    # clean up any partial embeddings saved under this name
                     try:
                         from memory.pi_memory import delete_person
                         delete_person(name)
                         self.recognizer.known_faces.pop(name, None)
-                        print(f"[Registration] Cleaned up partial data for {name}")
+                        print(f"[Registration] Cleaned up partial face data for {name} — password kept")
                     except Exception:
                         pass
-                    self.active_user = None
                     return
 
             if next_instruction:

@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import random
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -49,10 +50,21 @@ from hardware.motor_controller import MotorController
 from hardware.oled_eyes import OledEyes, EyeState
 from memory.pi_memory import delete_person
 from phone_link.core import process_notification
+from vision.behavior.pipeline import BehaviorDetectionPipeline, PipelineConfig
+from vision.behavior.whatsapp_alert import send_whatsapp_alert as send_telegram_alert
 
 os.environ["LIBCAMERA_LOG_LEVELS"] = "*:ERROR"
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+
+try:
+    from dotenv import load_dotenv
+    _env_path = ROOT_DIR / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+        print(f"[Config] Loaded .env from {_env_path}")
+except ImportError:
+    pass
 
 _VOSK_MODEL_PATH = str(ROOT_DIR / "vosk-model-small-en-us-0.15")
 _vosk_model = None
@@ -78,8 +90,8 @@ class RuntimeSettings:
     object_interval_frames: int = 20
     face_interval_frames: int = 15
     display_enabled: bool = os.getenv("BUDDY_ENABLE_DISPLAY", "1") != "0"
-    pc_camera_ip: str = os.getenv("BUDDY_PC_CAMERA_IP", "10.32.50.62")
-    pc_camera_port: int = int(os.getenv("BUDDY_PC_CAMERA_PORT", "5000"))
+    pc_camera_ip: str = "buddypc.local"
+    pc_camera_port: int = 5000
 
 
 class BuddyIntegratedPi:
@@ -105,6 +117,54 @@ class BuddyIntegratedPi:
         "Let me think.",
         "One moment.",
         "Thinking.",
+    )
+    _RESPONSE_DELAY_MIN_SAMPLES = 3
+    _RESPONSE_DELAY_RATIO = 1.5
+    _RESPONSE_DELAY_SECONDS = 5.0
+    _RESPONSE_AVG_ALPHA = 0.25
+    _VOICE_WEAK_MIN_SAMPLES = 5
+    _VOICE_WEAK_RATIO = 0.55
+    _VOICE_AVG_ALPHA = 0.2
+    _VISUAL_STILLNESS_SECONDS = 75.0
+    _VISUAL_CHECK_COOLDOWN_SECONDS = 120.0
+    _VISUAL_MOTION_THRESHOLD = 1.5
+    _FOLLOW_TARGET_AREA_RATIO = 0.08
+    _FOLLOW_TOO_CLOSE_AREA_RATIO = 0.22
+    _FOLLOW_CENTER_TOLERANCE = 0.18
+    _FOLLOW_COMMAND_INTERVAL = 0.35
+    _FOLLOW_LOST_TIMEOUT = 2.5
+    _SERVO_FACE_CENTER_TOLERANCE = 0.05
+    _SERVO_FACE_GAIN = 48.0
+    _SERVO_FACE_MIN_ANGLE = 30.0
+    _SERVO_FACE_MAX_ANGLE = 150.0
+    _SERVO_FACE_UPDATE_INTERVAL = 0.12
+    _BBOX_FALL_ASPECT_RATIO = 0.95
+    _BBOX_FALL_MIN_AREA_RATIO = 0.04
+    _BBOX_FALL_LOW_CENTER_RATIO = 0.48
+    _BBOX_FALL_CONFIRM_SECONDS = 1.2
+    _BBOX_FALL_ALERT_COOLDOWN_SECONDS = 90.0
+    _BLOOD_MIN_REGION_RATIO = 0.008
+    _BLOOD_MIN_SATURATION = 105
+    _BLOOD_MIN_VALUE = 35
+    _BLOOD_CONFIRM_SECONDS = 1.5
+    _BLOOD_ALERT_COOLDOWN_SECONDS = 180.0
+    _OK_RESPONSES = (
+        "yes", "yeah", "yep", "ok", "okay", "fine", "i am fine", "i'm fine",
+        "all good", "i am okay", "i'm okay", "yes i am", "yes i'm ok",
+    )
+    _NOT_OK_RESPONSES = (
+        "no", "nope", "not ok", "not okay", "help", "help me", "emergency",
+        "call someone", "call family", "call emergency", "i need help",
+        "i am not okay", "i'm not okay", "hurt", "pain",
+    )
+    _EMERGENCY_PHRASES = (
+        "emergency", "help me", "i need help", "call family",
+        "call my family", "call someone", "call emergency", "call ambulance",
+        "i fell", "i have fallen", "i am hurt", "i'm hurt", "chest pain",
+        "can't breathe", "cannot breathe", "hard to breathe", "feel dizzy",
+        "i feel dizzy", "i feel sick", "i am not feeling safe",
+        "i'm not feeling safe", "i do not feel safe", "i don't feel safe",
+        "i am unsafe", "i'm unsafe", "not safe", "unsafe",
     )
 
     # emotion string from LLM -> (EyeState, servo_action, motor_cmd)
@@ -177,11 +237,49 @@ class BuddyIntegratedPi:
         self._pending_face_scan = False
         self._pc_stream_active = False
         self._pc_stream_thread: Optional[threading.Thread] = None
+        self._response_time_stats_path = ROOT_DIR / "memory" / "response_time_stats.json"
+        self._response_time_stats: dict[str, dict[str, float]] = {}
+        self._emergency_active = False
+        self._last_voice_stats: dict[str, float] = {}
+        self._previous_behavior_frame: Optional[np.ndarray] = None
+        self._last_motion_time = time.time()
+        self._last_visual_check_time = 0.0
+        self._visual_check_active = False
+        self._pause_wake_listening = False
+        self.follow_mode = False
+        self._follow_last_command = "S"
+        self._follow_last_command_time = 0.0
+        self._follow_last_seen_time = 0.0
+        self._load_response_time_stats()
+        self.servo = None
+        self.servo_enabled = False
+        self._servo_face_last_update = 0.0
+        self._servo_face_tracking_enabled = os.getenv("BUDDY_SERVO_FACE_TRACKING", "1") != "0"
+        self._bbox_fall_started_at: Optional[float] = None
+        self._bbox_fall_last_alert_time = 0.0
+        self._blood_detect_started_at: Optional[float] = None
+        self._blood_last_alert_time = 0.0
+
+        self._behavior_pipeline = None
+        if os.getenv("BUDDY_ENABLE_MEDIAPIPE_BEHAVIOR", "0") == "1":
+            self._behavior_pipeline = BehaviorDetectionPipeline(
+                config=PipelineConfig(
+                    resize_width=224,
+                    resize_height=224,
+                    process_every_n_frames=2,
+                    sequence_length=12,
+                    enable_visualization=False,
+                ),
+                alert_callback=self._on_behavior_alert,
+            )
+        else:
+            self.logger.info("MediaPipe behavior pipeline disabled; using Pi-safe bbox fall detector.")
 
         self.aplay_device, self.usb_card_index = self._find_output_audio_device()
         self.arecord_device = self._find_input_audio_device()
         self._listen_loop: Optional[asyncio.AbstractEventLoop] = None
         self._working_arecord_device: Optional[str] = None
+        self._listen_initial_timeout: Optional[float] = None
 
         self._init_camera()
         self.stability = StabilityTracker(self.config)
@@ -192,6 +290,7 @@ class BuddyIntegratedPi:
         )
         self.motors.set_obstacle_callback(self._on_obstacle)
         self.motors.set_clear_callback(self._on_clear_path)
+        self._init_servo()
 
         self.tts_voice = "en-IN-NeerjaNeural"
         self.speech_enabled = True
@@ -209,6 +308,23 @@ class BuddyIntegratedPi:
             level=getattr(logging, self.config.log_level, logging.INFO),
             format=self.config.log_format,
         )
+
+    def _init_servo(self):
+        if not self.settings.use_servo or os.getenv("BUDDY_ENABLE_SERVO", "1") == "0":
+            self.logger.info("Servo disabled by settings")
+            return
+        try:
+            from hardware.servo_controller import ServoController
+            self.servo = ServoController(move_on_start=False)
+            self.servo_enabled = bool(getattr(self.servo, "_pwm", None))
+            if self.servo_enabled:
+                self.logger.info("Servo initialized")
+            else:
+                self.logger.warning("Servo controller loaded but PWM is unavailable")
+        except Exception as exc:
+            self.servo = None
+            self.servo_enabled = False
+            self.logger.warning("Servo unavailable: %s", exc)
 
     def _probe_local_vision_stack(self) -> bool:
         if os.getenv("BUDDY_DISABLE_LOCAL_VISION", "0") == "1":
@@ -496,7 +612,8 @@ class BuddyIntegratedPi:
         speech_thresh = 0.005
         silence_after = 0.4
         min_speech = 0.1
-        max_duration = 8.0
+        max_duration = float(os.getenv("BUDDY_RESPONSE_LISTEN_MAX", "30.0"))
+        initial_wait_timeout = self._listen_initial_timeout
 
         # use cached device — skip probe after first successful use
         if self._working_arecord_device:
@@ -550,6 +667,13 @@ class BuddyIntegratedPi:
                 rms = float(np.sqrt(np.mean(chunk ** 2)))
                 total_duration += target_chunk_secs
 
+                if (
+                    initial_wait_timeout is not None
+                    and not speech_started
+                    and total_duration >= initial_wait_timeout
+                ):
+                    break
+
                 if rms >= speech_thresh:
                     if not speech_started:
                         print("🎤️ Speech detected")
@@ -574,6 +698,7 @@ class BuddyIntegratedPi:
         import websockets
 
         audio = await asyncio.get_event_loop().run_in_executor(None, self._record_audio_vad)
+        self._last_voice_stats = self._measure_voice_stats(audio)
         if audio.size == 0:
             return ""
 
@@ -587,6 +712,16 @@ class BuddyIntegratedPi:
         except Exception as exc:
             self.logger.warning("STT websocket failed: %s", exc)
             return ""
+
+    def _measure_voice_stats(self, audio: np.ndarray) -> dict[str, float]:
+        if audio.size == 0:
+            return {}
+        abs_audio = np.abs(audio)
+        return {
+            "rms": float(np.sqrt(np.mean(audio ** 2))),
+            "peak": float(np.max(abs_audio)),
+            "duration": float(audio.size / 48000.0),
+        }
 
     def listen_for_speech(self) -> str:
         print("🎤 Listening (VAD)...")
@@ -604,6 +739,392 @@ class BuddyIntegratedPi:
             self.logger.warning("listen_for_speech failed: %s", exc)
             self._listen_loop = None
             return ""
+
+    def listen_for_speech_with_initial_timeout(self, timeout: float) -> str:
+        previous_timeout = self._listen_initial_timeout
+        self._listen_initial_timeout = timeout
+        try:
+            return self.listen_for_speech()
+        finally:
+            self._listen_initial_timeout = previous_timeout
+
+    def _response_user_key(self) -> str:
+        return (self.active_user or "unknown").strip().lower() or "unknown"
+
+    def _load_response_time_stats(self):
+        try:
+            if not self._response_time_stats_path.exists():
+                return
+            with open(self._response_time_stats_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                return
+            for user_key, stats in data.items():
+                if not isinstance(user_key, str) or not isinstance(stats, dict):
+                    continue
+                self._response_time_stats[user_key] = {
+                    "avg": float(stats.get("avg", 0.0)),
+                    "count": float(stats.get("count", 0.0)),
+                    "last": float(stats.get("last", 0.0)),
+                    "voice_avg_rms": float(stats.get("voice_avg_rms", 0.0)),
+                    "voice_count": float(stats.get("voice_count", 0.0)),
+                    "last_voice_rms": float(stats.get("last_voice_rms", 0.0)),
+                    "last_voice_peak": float(stats.get("last_voice_peak", 0.0)),
+                    "last_voice_duration": float(stats.get("last_voice_duration", 0.0)),
+                }
+        except Exception as exc:
+            self.logger.warning("Could not load response timing stats: %s", exc)
+
+    def _save_response_time_stats(self):
+        try:
+            self._response_time_stats_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._response_time_stats_path, "w", encoding="utf-8") as handle:
+                json.dump(self._response_time_stats, handle, indent=2)
+        except Exception as exc:
+            self.logger.warning("Could not save response timing stats: %s", exc)
+
+    def _record_response_time(self, elapsed: float):
+        user_key = self._response_user_key()
+        stats = self._response_time_stats.setdefault(
+            user_key,
+            {"avg": 0.0, "count": 0.0, "last": 0.0},
+        )
+        count = int(stats["count"])
+        if count == 0:
+            avg = elapsed
+        else:
+            avg = (stats["avg"] * (1.0 - self._RESPONSE_AVG_ALPHA)) + (elapsed * self._RESPONSE_AVG_ALPHA)
+        stats.update({"avg": avg, "count": float(count + 1), "last": elapsed})
+        print(f"[Response Watch] {user_key}: response={elapsed:.1f}s avg={avg:.1f}s samples={count + 1}")
+        self._save_response_time_stats()
+
+    def _response_is_delayed(self, elapsed: float) -> tuple[bool, float, int]:
+        stats = self._response_time_stats.get(self._response_user_key())
+        if not stats:
+            return False, 0.0, 0
+        avg = float(stats.get("avg", 0.0))
+        count = int(stats.get("count", 0))
+        if count < self._RESPONSE_DELAY_MIN_SAMPLES or avg <= 0:
+            return False, avg, count
+        delayed = (
+            elapsed >= avg + self._RESPONSE_DELAY_SECONDS
+            or elapsed >= avg * self._RESPONSE_DELAY_RATIO
+        )
+        return delayed, avg, count
+
+    def _record_voice_stats(self, voice_stats: dict[str, float]):
+        rms = float(voice_stats.get("rms", 0.0))
+        if rms <= 0:
+            return
+
+        user_key = self._response_user_key()
+        stats = self._response_time_stats.setdefault(
+            user_key,
+            {"avg": 0.0, "count": 0.0, "last": 0.0},
+        )
+        count = int(stats.get("voice_count", 0))
+        if count == 0:
+            avg_rms = rms
+        else:
+            avg_rms = (float(stats.get("voice_avg_rms", 0.0)) * (1.0 - self._VOICE_AVG_ALPHA)) + (
+                rms * self._VOICE_AVG_ALPHA
+            )
+
+        stats.update(
+            {
+                "voice_avg_rms": avg_rms,
+                "voice_count": float(count + 1),
+                "last_voice_rms": rms,
+                "last_voice_peak": float(voice_stats.get("peak", 0.0)),
+                "last_voice_duration": float(voice_stats.get("duration", 0.0)),
+            }
+        )
+        print(f"[Voice Watch] {user_key}: rms={rms:.4f} avg={avg_rms:.4f} samples={count + 1}")
+        self._save_response_time_stats()
+
+    def _voice_is_unusually_weak(self, voice_stats: dict[str, float]) -> tuple[bool, float, float, int]:
+        rms = float(voice_stats.get("rms", 0.0))
+        if rms <= 0:
+            return False, rms, 0.0, 0
+
+        stats = self._response_time_stats.get(self._response_user_key())
+        if not stats:
+            return False, rms, 0.0, 0
+
+        avg_rms = float(stats.get("voice_avg_rms", 0.0))
+        count = int(stats.get("voice_count", 0))
+        if count < self._VOICE_WEAK_MIN_SAMPLES or avg_rms <= 0:
+            return False, rms, avg_rms, count
+
+        return rms <= avg_rms * self._VOICE_WEAK_RATIO, rms, avg_rms, count
+
+    def _check_weak_voice_and_confirm(self, voice_stats: dict[str, float]) -> bool:
+        weak, rms, avg_rms, count = self._voice_is_unusually_weak(voice_stats)
+        if not weak:
+            return True
+
+        user_name = self.active_user or "there"
+        reason = f"Voice sounded weaker than usual for {user_name}: {rms:.4f} vs average {avg_rms:.4f}"
+        self.logger.warning("%s over %s samples", reason, count)
+        self.speak("Your voice sounds weaker than usual. Are you okay?")
+        self._wait_for_tts()
+        self._play_listen_beep()
+        self._eye(EyeState.LISTENING)
+        check_text = self.listen_for_speech_with_initial_timeout(10.0)
+        self._eye(EyeState.IDLE)
+
+        if check_text and self._is_ok_response(check_text):
+            self.speak("Okay. I am glad you are alright.")
+            return True
+
+        if not check_text or self._is_not_ok_response(check_text):
+            self._trigger_emergency_response(check_text or reason)
+            return False
+
+        self.speak("I am not sure I understood. I will stay alert. If you need help, say emergency.")
+        return True
+
+    def _is_ok_response(self, text: str) -> bool:
+        lowered = text.lower().strip()
+        return any(phrase in lowered for phrase in self._OK_RESPONSES)
+
+    def _is_not_ok_response(self, text: str) -> bool:
+        lowered = text.lower().strip()
+        return any(phrase in lowered for phrase in self._NOT_OK_RESPONSES)
+
+    def _is_emergency_phrase(self, text: str) -> bool:
+        lowered = text.lower().strip()
+        return any(phrase in lowered for phrase in self._EMERGENCY_PHRASES)
+
+    def _handle_passive_emergency_phrase(self, source: str, text: str):
+        self.follow_mode = False
+        self.motors.stop()
+        self._trigger_emergency_response(f"{source} heard: {text}")
+        self._wait_for_tts()
+
+    def _check_response_delay_and_confirm(self, elapsed: float) -> bool:
+        delayed, avg, count = self._response_is_delayed(elapsed)
+        if not delayed:
+            return True
+
+        user_name = self.active_user or "there"
+        self.logger.warning(
+            "Response delay detected for %s: %.1fs vs %.1fs average over %s samples",
+            user_name,
+            elapsed,
+            avg,
+            count,
+        )
+        self.speak("You took longer than usual to answer. Are you okay?")
+        self._wait_for_tts()
+        self._play_listen_beep()
+        self._eye(EyeState.LISTENING)
+        check_text = self.listen_for_speech_with_initial_timeout(10.0)
+        self._eye(EyeState.IDLE)
+
+        if check_text and self._is_ok_response(check_text):
+            self.speak("Okay. I am glad you are alright.")
+            return True
+
+        if not check_text or self._is_not_ok_response(check_text):
+            self._trigger_emergency_response(check_text or "No response to wellness check")
+            return False
+
+        self.speak("I am not sure I understood. I will stay alert. If you need help, say emergency.")
+        return True
+
+    def _trigger_emergency_response(self, reason: str):
+        if self._emergency_active:
+            self.logger.warning("Emergency response already active. Reason: %s", reason)
+            return
+        self._emergency_active = True
+        user_name = self.active_user or "unknown user"
+        message = f"Emergency check triggered for {user_name}. Reason: {reason}"
+        self.logger.error(message)
+        print(f"[EMERGENCY] {message}")
+        self.speak("I am contacting your emergency contacts now.")
+
+        jpeg_bytes = None
+        with self._stream_lock:
+            jpeg_bytes = self._stream_frame
+
+        self._send_alert_channels(
+            label="emergency",
+            severity="critical",
+            reason=message,
+            jpeg_bytes=jpeg_bytes,
+        )
+
+        webhook_url = os.getenv("BUDDY_EMERGENCY_WEBHOOK_URL", "").strip()
+        if webhook_url:
+            threading.Thread(
+                target=self._send_emergency_webhook,
+                args=(webhook_url, message, []),
+                daemon=True,
+            ).start()
+
+        call_command = os.getenv("BUDDY_EMERGENCY_CALL_COMMAND", "").strip()
+        if call_command:
+            threading.Thread(
+                target=self._run_emergency_call_command,
+                args=(call_command, message),
+                daemon=True,
+            ).start()
+
+    def _send_emergency_webhook(self, webhook_url: str, message: str, contacts: list[str]):
+        try:
+            response = requests.post(
+                webhook_url,
+                json={
+                    "message": message,
+                    "active_user": self.active_user,
+                    "contacts": contacts,
+                    "timestamp": time.time(),
+                },
+                timeout=10,
+            )
+            if response.status_code >= 400:
+                self.logger.warning("Emergency webhook returned status %s", response.status_code)
+        except Exception as exc:
+            self.logger.warning("Emergency webhook failed: %s", exc)
+
+    def _send_alert_channels(
+        self,
+        label: str,
+        severity: str,
+        reason: str,
+        jpeg_bytes: Optional[bytes] = None,
+    ):
+        message = (
+            f"Buddy alert: {label}\n"
+            f"Severity: {severity}\n"
+            f"Reason: {reason}\n"
+            "Please call or check immediately."
+        )
+
+        threading.Thread(
+            target=send_telegram_alert,
+            kwargs={
+                "label": label,
+                "severity": severity,
+                "reason": reason,
+                "jpeg_bytes": jpeg_bytes,
+            },
+            daemon=True,
+        ).start()
+
+        whatsapp_numbers = self._get_whatsapp_family_numbers()
+        if whatsapp_numbers:
+            threading.Thread(
+                target=self._send_whatsapp_family_alert,
+                args=(message, reason, whatsapp_numbers),
+                daemon=True,
+            ).start()
+        else:
+            print("[Alert] No BUDDY_FAMILY_WHATSAPP_NUMBERS configured.")
+
+    def _get_whatsapp_family_numbers(self) -> list[str]:
+        raw_numbers = os.getenv("BUDDY_FAMILY_WHATSAPP_NUMBERS", "").split(",")
+        return [number.strip() for number in raw_numbers if number.strip()]
+
+    def _send_whatsapp_family_alert(self, message: str, reason: str, numbers: list[str]):
+        token = os.getenv("BUDDY_WHATSAPP_TOKEN", "").strip()
+        phone_number_id = os.getenv("BUDDY_WHATSAPP_PHONE_NUMBER_ID", "").strip()
+        api_version = os.getenv("BUDDY_WHATSAPP_API_VERSION", "v21.0").strip() or "v21.0"
+
+        if not token or not phone_number_id:
+            self.logger.warning(
+                "WhatsApp alert skipped. Set BUDDY_WHATSAPP_TOKEN and BUDDY_WHATSAPP_PHONE_NUMBER_ID."
+            )
+            return
+
+        url = f"https://graph.facebook.com/{api_version}/{phone_number_id}/messages"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        user_name = self.active_user or "Buddy user"
+        template_name = os.getenv("BUDDY_WHATSAPP_TEMPLATE_NAME", "").strip()
+        template_language = os.getenv("BUDDY_WHATSAPP_TEMPLATE_LANGUAGE", "en_US").strip() or "en_US"
+
+        for number in numbers:
+            payload = self._build_whatsapp_alert_payload(
+                number=number,
+                message=message,
+                user_name=user_name,
+                reason=reason,
+                template_name=template_name,
+                template_language=template_language,
+            )
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=10)
+                if response.status_code >= 400:
+                    self.logger.warning(
+                        "WhatsApp alert failed for %s: %s",
+                        number,
+                        response.text,
+                    )
+                else:
+                    print(f"[EMERGENCY] WhatsApp alert sent to {number}.")
+            except Exception as exc:
+                self.logger.warning("WhatsApp alert error for %s: %s", number, exc)
+
+    def _build_whatsapp_alert_payload(
+        self,
+        number: str,
+        message: str,
+        user_name: str,
+        reason: str,
+        template_name: str,
+        template_language: str,
+    ) -> dict:
+        if template_name:
+            return {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": number,
+                "type": "template",
+                "template": {
+                    "name": template_name,
+                    "language": {"code": template_language},
+                    "components": [
+                        {
+                            "type": "body",
+                            "parameters": [
+                                {"type": "text", "text": user_name},
+                                {"type": "text", "text": reason},
+                            ],
+                        }
+                    ],
+                },
+            }
+
+        return {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": number,
+            "type": "text",
+            "text": {
+                "preview_url": False,
+                "body": (
+                    f"{message}\n"
+                    "Please call or check on them immediately."
+                ),
+            },
+        }
+
+    def _run_emergency_call_command(self, call_command: str, message: str):
+        try:
+            subprocess.run(
+                shlex.split(call_command),
+                input=message,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+        except Exception as exc:
+            self.logger.warning("Emergency call command failed: %s", exc)
 
     def _force_face_recognition(self) -> Optional[str]:
         try:
@@ -693,15 +1214,30 @@ class BuddyIntegratedPi:
     def _process_input(self, text: str):
         lowered = text.lower()
 
+        # 0. Emergency
+        if self._is_emergency_phrase(lowered):
+            self._trigger_emergency_response(text)
+            return
+
         # 1. Stop
         if self._is_stop_command(lowered):
+            self.follow_mode = False
             self.motors.stop()
             self.speak("Stopped.")
+            return
+
+        # 2. Follow mode
+        if any(p in lowered for p in ("follow me", "come with me", "track me")):
+            self._start_follow_mode()
+            return
+        if any(p in lowered for p in ("stop following", "don't follow", "do not follow")):
+            self._stop_follow_mode()
             return
 
         # 2. Move
         movement = self._parse_movement(lowered)
         if movement is not None:
+            self.follow_mode = False
             cmd, duration = movement
             self.motors.move(cmd, duration)
             self.speak(self._MOTOR_CONFIRMATIONS.get(cmd, "On it."))
@@ -726,20 +1262,35 @@ class BuddyIntegratedPi:
             if name_text:
                 name = self._extract_name(name_text)
                 if not name:
-                    # treat the whole utterance as the name if no phrase matched
                     words = [w.strip(".,!?") for w in name_text.split() if w.isalpha() and len(w) > 1]
                     name = words[0].title() if words else ""
             else:
                 name = ""
-            if name:
-                print(f"[Registration] Name heard: {name}")
-                self.active_user = name
-                self.speak(f"Nice to meet you {name}! I'll scan your face from different angles. Please look straight at me and hold still.")
-                self._wait_for_tts()
-                threading.Thread(target=self._do_scan_then_save, args=(name,), daemon=True).start()
-            else:
+            if not name:
                 print("[Registration] Could not get name")
                 self.speak("Sorry, I didn't catch your name. Please try again.")
+                return
+            print(f"[Registration] Name heard: {name}")
+
+            self.speak(f"Got it {name}! Now please set a password. Say any word or phrase you will remember.")
+            self._wait_for_tts()
+            time.sleep(0.1)
+            print("[Registration] Listening for password...")
+            self._play_listen_beep()
+            password_text = self.listen_for_speech()
+            if not password_text:
+                print("[Registration] Could not get password")
+                self.speak("Sorry, I didn't catch your password. Please try again.")
+                return
+            password = password_text.lower().strip()
+            print(f"[Registration] Password heard: '{password}'")
+            from memory.pi_memory import save_password
+            save_password(name, password)
+
+            self.active_user = name
+            self.speak(f"Password set! Now I'll scan your face from different angles. Please look straight at me and hold still.")
+            self._wait_for_tts()
+            threading.Thread(target=self._do_scan_then_save, args=(name,), daemon=True).start()
             return
 
         # 6. Identity check — single scan
@@ -760,37 +1311,66 @@ class BuddyIntegratedPi:
         self._display_response(response)
 
     def _check_and_greet_face(self):
-        """Single face scan — greet if known, say unknown if not."""
-        if not self.local_vision_enabled or self.detector is None or self.recognizer is None:
-            self.speak("I can't see right now.")
+        """Face scan first. If fails, fall back to password."""
+        from memory.pi_memory import find_name_by_password, get_all_names_with_passwords
+
+        # step 1: try face recognition
+        if self.local_vision_enabled and self.detector is not None and self.recognizer is not None:
+            print("[Face check] Reading frame...")
+            ok, frame = self._read_frame()
+            if not ok or frame is None:
+                frame = self.last_frame
+            if frame is not None:
+                print("[Face check] Detecting faces...")
+                faces = self.detector.detect(frame)
+                if faces:
+                    print(f"[Face check] {len(faces)} face(s) found, running recognition...")
+                    x, y, w, h = self.detector.get_largest_face(faces)
+                    face_roi = frame[y:y + h, x:x + w]
+                    name, confidence = self.recognizer.recognize(face_roi)
+                    print(f"[Face check] Result: {name} (confidence: {confidence:.2f})")
+                    if name != "Unknown" and confidence > 0.45:
+                        self.active_user = name
+                        print(f"[Face check] Match found: {name}")
+                        self.speak(f"Hi {name}! Good to see you.")
+                        self._wait_for_tts()
+                        return
+                    print(f"[Face check] No face match (confidence: {confidence:.2f}) — trying password")
+                else:
+                    print("[Face check] No faces found — trying password")
+            else:
+                print("[Face check] No frame — trying password")
+        else:
+            print("[Face check] Vision unavailable — trying password")
+
+        # step 2: password fallback
+        registered = get_all_names_with_passwords()
+        if not registered:
+            self.speak("I don't recognize you and no one is registered yet. Say register my face to get started.")
             return
-        print("[Face check] Reading frame...")
-        ok, frame = self._read_frame()
-        if not ok or frame is None:
-            frame = self.last_frame
-        if frame is None:
-            print("[Face check] No frame available")
-            self.speak("I can't see right now.")
+
+        self.speak("I couldn't recognize your face. Please say your password.")
+        self._wait_for_tts()
+        time.sleep(0.1)
+        print("[Password check] Listening for password...")
+        self._play_listen_beep()
+        password_text = self.listen_for_speech()
+        if not password_text:
+            print("[Password check] No password heard")
+            self.speak("Sorry, I didn't catch that. I don't know you.")
             return
-        print("[Face check] Detecting faces...")
-        faces = self.detector.detect(frame)
-        if not faces:
-            print("[Face check] No faces found")
-            self.speak("I don't see anyone in front of me.")
-            return
-        print(f"[Face check] {len(faces)} face(s) found, running recognition...")
-        x, y, w, h = self.detector.get_largest_face(faces)
-        face_roi = frame[y:y + h, x:x + w]
-        name, confidence = self.recognizer.recognize(face_roi)
-        print(f"[Face check] Result: {name} (confidence: {confidence:.2f})")
-        if name != "Unknown" and confidence > 0.45:
-            self.active_user = name
-            print(f"[Face check] Match found: {name} — speaking greeting")
-            self.speak(f"Hi {name}! Good to see you.")
+
+        password = password_text.lower().strip()
+        print(f"[Password check] Heard: '{password}'")
+        found_name = find_name_by_password(password)
+        if found_name:
+            self.active_user = found_name
+            print(f"[Password check] Password matched: {found_name}")
+            self.speak(f"Hi {found_name}! Good to see you.")
             self._wait_for_tts()
         else:
-            print(f"[Face check] No match (best confidence: {confidence:.2f}) — speaking unknown")
-            self.speak("I don't recognize you. Say register my face if you'd like me to remember you.")
+            print(f"[Password check] No match for: '{password}'")
+            self.speak("Sorry, I don't know you.")
             self._wait_for_tts()
 
     def _do_scan_then_save(self, name: str):
@@ -842,18 +1422,16 @@ class BuddyIntegratedPi:
                 print(f"[Registration] ⚠️ Failed to capture {angle} angle for {name} (failures so far: {failed_angles})")
                 self.logger.warning("Could not capture %s angle for %s", angle, name)
                 if failed_angles >= 3:
-                    print(f"[Registration] ❌ Too many failures — falling back to default conversation")
-                    self.speak("I'm having trouble scanning your face. Falling back to default conversation. You can still talk to me normally.")
+                    print(f"[Registration] ❌ Too many failures — saving name+password only")
+                    self.speak("I'm having trouble scanning your face. I've saved your name and password. You can use your password to identify yourself next time.")
                     self._wait_for_tts()
-                    # clean up any partial embeddings saved under this name
                     try:
                         from memory.pi_memory import delete_person
                         delete_person(name)
                         self.recognizer.known_faces.pop(name, None)
-                        print(f"[Registration] Cleaned up partial data for {name}")
+                        print(f"[Registration] Cleaned up partial face data for {name} — password kept")
                     except Exception:
                         pass
-                    self.active_user = None
                     return
 
             if next_instruction:
@@ -978,7 +1556,10 @@ class BuddyIntegratedPi:
                     2,
                 )
 
-        status = f"Chatting with: {self.active_user}" if self.active_user else "Looking for people..."
+        if self.follow_mode:
+            status = "Follow mode active"
+        else:
+            status = f"Chatting with: {self.active_user}" if self.active_user else "Looking for people..."
         cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         return frame
 
@@ -1065,6 +1646,34 @@ class BuddyIntegratedPi:
             self._display_response(response)
             self._wait_for_tts()
 
+    def _on_behavior_alert(self, result: dict):
+        """Called by behavior pipeline on risk detection — speaks alert and sends WhatsApp."""
+        decision = result.get("decision", {})
+        label = decision.get("label", "unknown")
+        severity = decision.get("severity", "low")
+        reason = decision.get("reason", "")
+        print(f"[Behavior] 🚨 ALERT: {label} | {severity} | {reason}")
+
+        jpeg_bytes = None
+        with self._stream_lock:
+            jpeg_bytes = self._stream_frame
+
+        if not self.is_speaking:
+            msg = {
+                "fall_detected": "Warning! Someone may have fallen!",
+                "possible_medical_emergency": "Emergency! Someone may need medical help!",
+                "injury_suspected": "Alert! Someone appears to be injured.",
+                "monitor_closely": "Someone has been inactive for a while.",
+            }.get(label, f"Behavior alert: {label}")
+            self.speak(msg)
+
+        self._send_alert_channels(
+            label=label,
+            severity=severity,
+            reason=reason,
+            jpeg_bytes=jpeg_bytes,
+        )
+
     def _on_obstacle(self):
         if not self.is_speaking:
             self.speak("Obstacle detected. I have stopped.")
@@ -1072,6 +1681,393 @@ class BuddyIntegratedPi:
     def _on_clear_path(self):
         if not self.is_speaking:
             self.speak("Path is clear.")
+
+    def _start_follow_mode(self):
+        if not self.motors.is_connected():
+            self.speak("I cannot follow right now because the motors are not connected.")
+            return
+        self.follow_mode = True
+        self._follow_last_command = "S"
+        self._follow_last_command_time = 0.0
+        self._follow_last_seen_time = time.time()
+        self.speak("Okay, I will follow you. Say stop when you want me to stop.")
+
+    def _stop_follow_mode(self):
+        self.follow_mode = False
+        self._follow_last_command = "S"
+        self.motors.stop()
+        self.speak("Okay, I stopped following.")
+
+    def _get_follow_target(self, frame: np.ndarray) -> Optional[tuple[float, float, float]]:
+        frame_h, frame_w = frame.shape[:2]
+        frame_area = float(max(1, frame_w * frame_h))
+
+        if self.last_faces:
+            x, y, w, h = max(self.last_faces, key=lambda box: box[2] * box[3])
+            return ((x + w / 2.0) / frame_w, (w * h) / frame_area, float(w * h))
+
+        person_boxes = []
+        for det in self.current_detections:
+            if not isinstance(det, dict) or det.get("name") != "person":
+                continue
+            box = det.get("box") or det.get("bbox") or det.get("xyxy")
+            if not box or len(box) < 4:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in box[:4]]
+            width = max(0.0, x2 - x1)
+            height = max(0.0, y2 - y1)
+            area = width * height
+            if area > 0:
+                person_boxes.append((x1, y1, width, height, area))
+
+        if not person_boxes:
+            return None
+
+        x, y, w, h, area = max(person_boxes, key=lambda box: box[4])
+        return ((x + w / 2.0) / frame_w, area / frame_area, area)
+
+    def _send_follow_command(self, cmd: str, duration: Optional[float] = None):
+        now = time.time()
+        if cmd == self._follow_last_command and (now - self._follow_last_command_time) < self._FOLLOW_COMMAND_INTERVAL:
+            return
+        self._follow_last_command = cmd
+        self._follow_last_command_time = now
+        if cmd == "S":
+            self.motors.stop()
+        else:
+            self.motors.move(cmd, duration)
+
+    def _update_follow_mode(self, frame: np.ndarray):
+        if not self.follow_mode or self.sleep_mode or self._emergency_active:
+            return
+        if not self.motors.is_connected():
+            self.follow_mode = False
+            self.motors.stop()
+            return
+
+        target = self._get_follow_target(frame)
+        if target is None:
+            if time.time() - self._follow_last_seen_time > self._FOLLOW_LOST_TIMEOUT:
+                self._send_follow_command("S")
+            return
+
+        self._follow_last_seen_time = time.time()
+        center_x, area_ratio, _ = target
+        error_x = center_x - 0.5
+
+        center_tolerance = float(os.getenv("BUDDY_FOLLOW_CENTER_TOLERANCE", self._FOLLOW_CENTER_TOLERANCE))
+        target_area = float(os.getenv("BUDDY_FOLLOW_TARGET_AREA_RATIO", self._FOLLOW_TARGET_AREA_RATIO))
+        too_close_area = float(os.getenv("BUDDY_FOLLOW_TOO_CLOSE_AREA_RATIO", self._FOLLOW_TOO_CLOSE_AREA_RATIO))
+
+        if abs(error_x) > center_tolerance:
+            self._send_follow_command("R" if error_x > 0 else "L", 0.25)
+            return
+
+        if area_ratio < target_area:
+            self._send_follow_command("F", 0.45)
+            return
+
+        if area_ratio > too_close_area:
+            self._send_follow_command("B", 0.25)
+            return
+
+        self._send_follow_command("S")
+
+    def _update_servo_face_tracking(self, frame: np.ndarray):
+        if not self._servo_face_tracking_enabled:
+            return
+        if not self.servo_enabled or not self.servo or not self.last_faces:
+            return
+
+        now = time.time()
+        interval = float(os.getenv("BUDDY_SERVO_FACE_UPDATE_INTERVAL", self._SERVO_FACE_UPDATE_INTERVAL))
+        if now - self._servo_face_last_update < interval:
+            return
+
+        frame_h, _ = frame.shape[:2]
+        if frame_h <= 0:
+            return
+
+        x, y, w, h = max(self.last_faces, key=lambda box: box[2] * box[3])
+        face_center_y = y + (h / 2.0)
+        y_ratio = face_center_y / frame_h
+        error = y_ratio - 0.5
+
+        tolerance = float(os.getenv("BUDDY_SERVO_FACE_CENTER_TOLERANCE", self._SERVO_FACE_CENTER_TOLERANCE))
+        if abs(error) < tolerance:
+            return
+
+        gain = float(os.getenv("BUDDY_SERVO_FACE_GAIN", self._SERVO_FACE_GAIN))
+        min_angle = float(os.getenv("BUDDY_SERVO_FACE_MIN_ANGLE", self._SERVO_FACE_MIN_ANGLE))
+        max_angle = float(os.getenv("BUDDY_SERVO_FACE_MAX_ANGLE", self._SERVO_FACE_MAX_ANGLE))
+        try:
+            current_angle = float(self.servo.get_angle())
+        except Exception:
+            return
+
+        new_angle = current_angle - (error * gain)
+        new_angle = max(min_angle, min(max_angle, new_angle))
+        if abs(new_angle - current_angle) < 1.0:
+            return
+
+        self._servo_face_last_update = now
+        threading.Thread(target=self.servo.move_to, args=(new_angle, True), daemon=True).start()
+
+    def _person_or_face_visible(self) -> bool:
+        if self.last_faces:
+            return True
+        return any(
+            isinstance(det, dict) and det.get("name") == "person"
+            for det in self.current_detections
+        )
+
+    def _largest_person_bbox(self) -> Optional[tuple[float, float, float, float]]:
+        person_boxes = []
+        for det in self.current_detections:
+            if not isinstance(det, dict) or det.get("name") != "person":
+                continue
+            box = det.get("bbox") or det.get("box") or det.get("xyxy")
+            if not box or len(box) < 4:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in box[:4]]
+            width = max(0.0, x2 - x1)
+            height = max(0.0, y2 - y1)
+            area = width * height
+            if area > 0:
+                person_boxes.append((area, x1, y1, x2, y2))
+        if not person_boxes:
+            return None
+        _, x1, y1, x2, y2 = max(person_boxes, key=lambda item: item[0])
+        return x1, y1, x2, y2
+
+    def _update_bbox_fall_monitor(self, frame: np.ndarray):
+        if os.getenv("BUDDY_ENABLE_BBOX_FALL_DETECTION", "1") == "0":
+            return
+        if self.sleep_mode or self._emergency_active:
+            return
+
+        bbox = self._largest_person_bbox()
+        if bbox is None:
+            self._bbox_fall_started_at = None
+            return
+
+        frame_h, frame_w = frame.shape[:2]
+        frame_area = float(max(1, frame_w * frame_h))
+        x1, y1, x2, y2 = bbox
+        width = max(1.0, x2 - x1)
+        height = max(1.0, y2 - y1)
+        aspect_ratio = width / height
+        area_ratio = (width * height) / frame_area
+        center_y_ratio = ((y1 + y2) / 2.0) / max(1.0, float(frame_h))
+
+        fall_aspect = float(os.getenv("BUDDY_BBOX_FALL_ASPECT_RATIO", self._BBOX_FALL_ASPECT_RATIO))
+        min_area = float(os.getenv("BUDDY_BBOX_FALL_MIN_AREA_RATIO", self._BBOX_FALL_MIN_AREA_RATIO))
+        low_center = float(os.getenv("BUDDY_BBOX_FALL_LOW_CENTER_RATIO", self._BBOX_FALL_LOW_CENTER_RATIO))
+        confirm_seconds = float(os.getenv("BUDDY_BBOX_FALL_CONFIRM_SECONDS", self._BBOX_FALL_CONFIRM_SECONDS))
+        cooldown = float(os.getenv("BUDDY_BBOX_FALL_ALERT_COOLDOWN_SECONDS", self._BBOX_FALL_ALERT_COOLDOWN_SECONDS))
+
+        looks_fallen = (
+            aspect_ratio >= fall_aspect
+            and area_ratio >= min_area
+            and center_y_ratio >= low_center
+        )
+        now = time.time()
+        if not looks_fallen:
+            self._bbox_fall_started_at = None
+            return
+
+        if self._bbox_fall_started_at is None:
+            self._bbox_fall_started_at = now
+            return
+
+        if now - self._bbox_fall_started_at < confirm_seconds:
+            return
+        if now - self._bbox_fall_last_alert_time < cooldown:
+            return
+
+        self._bbox_fall_last_alert_time = now
+        reason = (
+            "Pi-safe bbox fall detector: person appears horizontal/low "
+            f"for {now - self._bbox_fall_started_at:.1f}s "
+            f"(aspect={aspect_ratio:.2f}, area={area_ratio:.2f}, center_y={center_y_ratio:.2f})"
+        )
+        print(f"[Behavior] BBox fall alert: {reason}")
+        jpeg_bytes = None
+        with self._stream_lock:
+            jpeg_bytes = self._stream_frame
+
+        if not self.is_speaking:
+            self.speak("Warning. Someone may have fallen.")
+
+        self._send_alert_channels(
+            label="fall_detected",
+            severity="high",
+            reason=reason,
+            jpeg_bytes=jpeg_bytes,
+        )
+
+    def _update_blood_monitor(self, frame: np.ndarray):
+        """Detect blood-like red pooling as a low-confidence visual risk signal."""
+        if os.getenv("BUDDY_ENABLE_BLOOD_HEURISTIC", "1") == "0":
+            return
+        if self.sleep_mode or self._emergency_active:
+            return
+
+        roi = frame
+        bbox = self._largest_person_bbox()
+        if bbox is not None:
+            frame_h, frame_w = frame.shape[:2]
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            pad_x = int((x2 - x1) * 0.25)
+            pad_y = int((y2 - y1) * 0.25)
+            x1 = max(0, x1 - pad_x)
+            y1 = max(0, y1 - pad_y)
+            x2 = min(frame_w, x2 + pad_x)
+            y2 = min(frame_h, y2 + pad_y)
+            if x2 > x1 and y2 > y1:
+                roi = frame[y1:y2, x1:x2]
+
+        if roi.size == 0:
+            self._blood_detect_started_at = None
+            return
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        sat_min = int(os.getenv("BUDDY_BLOOD_MIN_SATURATION", str(self._BLOOD_MIN_SATURATION)))
+        val_min = int(os.getenv("BUDDY_BLOOD_MIN_VALUE", str(self._BLOOD_MIN_VALUE)))
+
+        lower_red_1 = np.array([0, sat_min, val_min], dtype=np.uint8)
+        upper_red_1 = np.array([12, 255, 255], dtype=np.uint8)
+        lower_red_2 = np.array([165, sat_min, val_min], dtype=np.uint8)
+        upper_red_2 = np.array([180, 255, 255], dtype=np.uint8)
+
+        mask = cv2.inRange(hsv, lower_red_1, upper_red_1) | cv2.inRange(hsv, lower_red_2, upper_red_2)
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        red_ratio = float(np.count_nonzero(mask)) / float(mask.size)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        largest_contour_area = max((cv2.contourArea(contour) for contour in contours), default=0.0)
+        contour_ratio = largest_contour_area / float(max(1, roi.shape[0] * roi.shape[1]))
+        redness_strength = float(np.mean(hsv[:, :, 1][mask > 0])) if np.any(mask) else 0.0
+
+        min_ratio = float(os.getenv("BUDDY_BLOOD_MIN_REGION_RATIO", str(self._BLOOD_MIN_REGION_RATIO)))
+        looks_blood_like = (
+            red_ratio >= min_ratio
+            and contour_ratio >= (min_ratio * 0.4)
+            and redness_strength >= max(sat_min, 100)
+            and self._person_or_face_visible()
+        )
+
+        now = time.time()
+        if not looks_blood_like:
+            self._blood_detect_started_at = None
+            return
+
+        if self._blood_detect_started_at is None:
+            self._blood_detect_started_at = now
+            return
+
+        confirm_seconds = float(os.getenv("BUDDY_BLOOD_CONFIRM_SECONDS", str(self._BLOOD_CONFIRM_SECONDS)))
+        cooldown = float(os.getenv("BUDDY_BLOOD_ALERT_COOLDOWN_SECONDS", str(self._BLOOD_ALERT_COOLDOWN_SECONDS)))
+        if (now - self._blood_detect_started_at) < confirm_seconds:
+            return
+        if (now - self._blood_last_alert_time) < cooldown:
+            return
+
+        self._blood_last_alert_time = now
+        reason = (
+            "Experimental blood-like scene heuristic triggered "
+            f"(red_ratio={red_ratio:.3f}, contour_ratio={contour_ratio:.3f}, "
+            f"redness={redness_strength:.1f}). This is not a medical diagnosis."
+        )
+        print(f"[Behavior] Blood-like alert: {reason}")
+        jpeg_bytes = None
+        with self._stream_lock:
+            jpeg_bytes = self._stream_frame
+
+        if not self.is_speaking:
+            self.speak("Warning. I can see a possible blood-like scene. Please check immediately.")
+
+        self._send_alert_channels(
+            label="possible_blood_detected",
+            severity="high",
+            reason=reason,
+            jpeg_bytes=jpeg_bytes,
+        )
+
+    def _update_behavior_monitor(self, frame: np.ndarray):
+        if os.getenv("BUDDY_ENABLE_VISUAL_SAFETY", "1") == "0":
+            return
+        if self.sleep_mode or self._emergency_active:
+            return
+
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
+        except Exception as exc:
+            self.logger.warning("Behavior monitor frame prep failed: %s", exc)
+            return
+
+        if self._previous_behavior_frame is None:
+            self._previous_behavior_frame = gray
+            self._last_motion_time = time.time()
+            return
+
+        diff = cv2.absdiff(self._previous_behavior_frame, gray)
+        motion_score = float(np.mean(diff))
+        self._previous_behavior_frame = gray
+
+        if motion_score >= float(os.getenv("BUDDY_VISUAL_MOTION_THRESHOLD", self._VISUAL_MOTION_THRESHOLD)):
+            self._last_motion_time = time.time()
+
+        if not self._person_or_face_visible():
+            self._last_motion_time = time.time()
+            return
+
+        now = time.time()
+        still_for = now - self._last_motion_time
+        stillness_limit = float(os.getenv("BUDDY_VISUAL_STILLNESS_SECONDS", self._VISUAL_STILLNESS_SECONDS))
+        cooldown = float(os.getenv("BUDDY_VISUAL_CHECK_COOLDOWN_SECONDS", self._VISUAL_CHECK_COOLDOWN_SECONDS))
+
+        if still_for < stillness_limit:
+            return
+        if self._visual_check_active or (now - self._last_visual_check_time) < cooldown:
+            return
+
+        reason = f"Person or face visible with very little movement for {still_for:.0f} seconds"
+        self._visual_check_active = True
+        self._last_visual_check_time = now
+        threading.Thread(
+            target=self._visual_wellness_check,
+            args=(reason,),
+            daemon=True,
+        ).start()
+
+    def _visual_wellness_check(self, reason: str):
+        self._pause_wake_listening = True
+        try:
+            self.logger.warning("Visual safety check: %s", reason)
+            self.speak("I have not seen you move for a while. Are you okay?")
+            self._wait_for_tts()
+            self._play_listen_beep()
+            self._eye(EyeState.LISTENING)
+            answer = self.listen_for_speech_with_initial_timeout(10.0)
+            self._eye(EyeState.IDLE)
+
+            if answer and self._is_ok_response(answer):
+                self.speak("Okay. I am glad you are alright.")
+                self._last_motion_time = time.time()
+                return
+
+            if not answer or self._is_not_ok_response(answer):
+                self._trigger_emergency_response(answer or reason)
+                return
+
+            self.speak("I am not sure I understood. I will stay alert. If you need help, say emergency.")
+        finally:
+            self._visual_check_active = False
+            self._pause_wake_listening = False
 
     def _start_stream_server(self, port: int = 8080):
         buddy = self
@@ -1146,6 +2142,24 @@ class BuddyIntegratedPi:
             else:
                 processed = frame
 
+            if self.frame_count % 10 == 0:
+                self._update_behavior_monitor(frame)
+                self._update_bbox_fall_monitor(frame)
+                self._update_blood_monitor(frame)
+                self._update_follow_mode(frame)
+                self._update_servo_face_tracking(frame)
+
+            # pose-based behavior pipeline every 3rd frame
+            if self._behavior_pipeline is not None and self.frame_count % 3 == 0:
+                try:
+                    result = self._behavior_pipeline.process_frame(frame)
+                    if result.get("frame_processed") and result.get("person_detected"):
+                        decision = result.get("decision", {})
+                        if decision.get("label") not in ("normal", None):
+                            print(f"[Behavior] {decision.get('label')} | {decision.get('severity')} | {decision.get('reason')}")
+                except Exception as exc:
+                    self.logger.warning("Behavior pipeline error: %s", exc)
+
             ok, buf = cv2.imencode(".jpg", processed, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 with self._stream_lock:
@@ -1157,6 +2171,8 @@ class BuddyIntegratedPi:
         if not _vosk_available:
             return False
         rec = _KaldiRecognizer(_vosk_model, 16000)
+        wake_detected = False
+        emergency_text = ""
         proc = subprocess.Popen(
             ["arecord", "-D", self.arecord_device, "-f", "S16_LE", "-r", "16000", "-c", "1"],
             stdout=subprocess.PIPE,
@@ -1165,6 +2181,8 @@ class BuddyIntegratedPi:
         print(f"[Vosk] Listening on {self.arecord_device}...")
         try:
             while self.running:
+                if self._pause_wake_listening:
+                    return False
                 raw = proc.stdout.read(8000)
                 if not raw:
                     print("[Vosk] arecord stream ended")
@@ -1180,13 +2198,25 @@ class BuddyIntegratedPi:
                     text = json.loads(rec.PartialResult()).get("partial", "").lower()
                     if text:
                         print(f"[Vosk] Partial: '{text}'")
-                if text and any(w in text for w in self._WAKE_WORDS):
+                if not text:
+                    continue
+                if self._is_emergency_phrase(text):
+                    emergency_text = text
+                    print(f"[Vosk] Emergency phrase: '{text}'")
+                    break
+                if any(w in text for w in self._WAKE_WORDS):
+                    wake_detected = True
                     print(f"Wake word: '{text}'")
-                    return True
+                    break
         finally:
             proc.kill()
             proc.wait()
-        return False
+
+        if emergency_text:
+            self._handle_passive_emergency_phrase("Vosk", emergency_text)
+            return False
+
+        return wake_detected
 
     def _startup_greeting(self):
         time.sleep(1.0)
@@ -1195,11 +2225,18 @@ class BuddyIntegratedPi:
     def _wake_loop(self):
         print("Waiting for 'Buddy'...")
         while self.running and not self.sleep_mode:
+            if self._pause_wake_listening:
+                time.sleep(0.1)
+                continue
             if _vosk_available:
                 detected = self._vosk_listen_for_wake_word()
             else:
                 text = self.listen_for_speech()
-                detected = bool(text) and any(w in text.lower() for w in self._WAKE_WORDS)
+                lowered = text.lower() if text else ""
+                if lowered and self._is_emergency_phrase(lowered):
+                    self._handle_passive_emergency_phrase("STT", lowered)
+                    continue
+                detected = bool(lowered) and any(w in lowered for w in self._WAKE_WORDS)
 
             if not detected:
                 continue
@@ -1208,9 +2245,20 @@ class BuddyIntegratedPi:
             time.sleep(0.3)
             self._play_listen_beep()
             self._eye(EyeState.LISTENING)
+            listen_started = time.monotonic()
             user_text = self.listen_for_speech()
+            response_elapsed = time.monotonic() - listen_started
+            voice_stats = dict(self._last_voice_stats)
             self._eye(EyeState.IDLE)
+            if not self._check_response_delay_and_confirm(response_elapsed):
+                self._wait_for_tts()
+                continue
             if user_text:
+                if not self._check_weak_voice_and_confirm(voice_stats):
+                    self._wait_for_tts()
+                    continue
+                self._record_response_time(response_elapsed)
+                self._record_voice_stats(voice_stats)
                 self._process_input(user_text)
                 self._wait_for_tts()
 
@@ -1239,7 +2287,11 @@ class BuddyIntegratedPi:
                         break
                 else:
                     text = self.listen_for_speech()
-                    if text and any(w in text.lower() for w in self._WAKE_WORDS):
+                    lowered = text.lower() if text else ""
+                    if lowered and self._is_emergency_phrase(lowered):
+                        self._handle_passive_emergency_phrase("STT", lowered)
+                        continue
+                    if lowered and any(w in lowered for w in self._WAKE_WORDS):
                         self.sleep_mode = False
                         self._eye(EyeState.WAKING)
                         self.speak("I am awake. What can I do for you?")
@@ -1254,6 +2306,7 @@ class BuddyIntegratedPi:
 
     def run(self):
         self.running = True
+        print("[Safety] Passive camera and emergency-phrase detection enabled. Wake word is not required for alerts.")
         self._start_phone_listener()
         self._start_stream_server(port=8090)
         self._camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
@@ -1276,6 +2329,13 @@ class BuddyIntegratedPi:
             self.motors.cleanup()
         except Exception:
             pass
+        if self.servo_enabled and self.servo:
+            try:
+                self.servo.cleanup()
+            except Exception:
+                pass
+            finally:
+                self.servo_enabled = False
         self._pc_stream_active = False
         if self.cap is not None:
             try:

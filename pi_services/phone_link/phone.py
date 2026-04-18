@@ -4,6 +4,14 @@ import uvicorn
 
 app = FastAPI()
 
+try:
+    from vision.behavior.api_integration import router as behavior_router
+except Exception:
+    behavior_router = None
+
+if behavior_router is not None:
+    app.include_router(behavior_router)
+
 # 🧠 Memory to avoid duplicates
 last_notifications = set()
 

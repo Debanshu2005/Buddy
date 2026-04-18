@@ -4,6 +4,7 @@
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
 scipy>=1.10.0
+mediapipe>=0.10.0
 
 # ===============================
 # Raspberry Pi Camera
@@ -14,6 +15,7 @@ picamera2
 # Machine Learning (ONNX only - Python 3.13 compatible)
 # ===============================
 onnxruntime>=1.16.0
+scikit-learn>=1.4.0
 
 # ===============================
 # Face Recognition (InsightFace ArcFace + RetinaFace)
@@ -35,6 +37,8 @@ python-dotenv>=1.0.0
 # HTTP Requests
 # ===============================
 requests>=2.31.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
 
 # ===============================
 # Speech and TTS
