@@ -234,6 +234,9 @@ class BuddyIntegratedPi:
     _FOLLOW_CENTER_TOLERANCE = 0.18
     _FOLLOW_COMMAND_INTERVAL = 0.35
     _FOLLOW_LOST_TIMEOUT = 2.5
+    _FOLLOW_FACE_LOOK_UP_DEGREES = 30.0
+    _FOLLOW_FACE_SCAN_SETTLE_SECONDS = 0.8
+    _FOLLOW_FACE_SCAN_TIMEOUT = 1.8
     _ULTRASONIC_POLL_INTERVAL = 0.15
     _ULTRASONIC_ANNOUNCE_COOLDOWN = 3.0
     _SERVO_FACE_CENTER_TOLERANCE = 0.05
@@ -560,6 +563,36 @@ class BuddyIntegratedPi:
             self.speak("Looking straight ahead.")
             return True
 
+        return False
+
+    def _prepare_follow_face_lock(self) -> bool:
+        if self.servo_enabled and self.servo:
+            try:
+                center_angle = float(getattr(self.servo, "POS_CENTER", 90.0))
+                target_angle = min(180.0, center_angle + self._FOLLOW_FACE_LOOK_UP_DEGREES)
+                self.servo.move_to(target_angle, True)
+                time.sleep(self._FOLLOW_FACE_SCAN_SETTLE_SECONDS)
+            except Exception as exc:
+                self.logger.warning("Servo follow positioning failed: %s", exc)
+
+        deadline = time.time() + self._FOLLOW_FACE_SCAN_TIMEOUT
+        while time.time() < deadline:
+            frame = self.last_frame
+            if frame is None:
+                ok, fresh = self._read_frame()
+                frame = fresh if ok else None
+            if frame is not None and self.local_vision_enabled and self.detector is not None:
+                try:
+                    faces = self.detector.detect(frame)
+                except Exception as exc:
+                    self.logger.warning("Follow face detection failed: %s", exc)
+                    faces = []
+                if faces:
+                    self.last_faces = faces
+                    return True
+            time.sleep(0.12)
+
+        self.last_faces = []
         return False
 
     def _probe_local_vision_stack(self) -> bool:
@@ -2026,6 +2059,12 @@ class BuddyIntegratedPi:
             return
         if self._ultrasonic_blocked:
             self._announce_proximity_stop(force=True)
+            return
+        if not self._prepare_follow_face_lock():
+            self.follow_mode = False
+            self._follow_last_command = "S"
+            self.motors.stop()
+            self.speak("Face not found. Please move backward so I can see your face.")
             return
         self.follow_mode = True
         self._follow_last_command = "S"
