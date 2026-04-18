@@ -53,6 +53,86 @@ from phone_link.core import process_notification
 from vision.behavior.pipeline import BehaviorDetectionPipeline, PipelineConfig
 from vision.behavior.whatsapp_alert import send_whatsapp_alert as send_telegram_alert
 
+# ---------------------------------------------------------------------------
+# Surveillance client — polls the PC surveillance server
+# ---------------------------------------------------------------------------
+
+class _SurveillanceClient:
+    """
+    Polls GET http://<pc_ip>:8001/latest every POLL_INTERVAL seconds.
+    Fires alert_callback(event_type, description, confidence, jpeg_bytes)
+    for every new event that crosses the severity threshold.
+    """
+
+    POLL_INTERVAL = 0.5   # seconds between polls
+
+    # Events that warrant an immediate emergency response
+    _CRITICAL = {
+        "fall", "person_down", "hand_on_chest", "eyes_closed",
+        "trembling", "head_tilt",
+    }
+    # Events that send an alert but don't trigger full emergency
+    _HIGH = {
+        "hands_raised", "prolonged_inactivity", "covering_face", "head_drooping",
+    }
+    # Events that are logged/spoken but no external alert
+    _MEDIUM = {
+        "clutching_stomach", "hunching", "crouching",
+    }
+
+    def __init__(self, pc_ip: str, port: int, alert_callback, cooldown: float = 30.0):
+        self._url = f"http://{pc_ip}:{port}/latest"
+        self._alert_callback = alert_callback
+        self._cooldown = cooldown
+        self._last_fired: dict[str, float] = {}
+        self._thread: threading.Thread | None = None
+        self._running = False
+
+    def start(self) -> None:
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="SurveillanceClient")
+        self._thread.start()
+        print(f"[Surveillance] Client started — polling {self._url}")
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _can_fire(self, event_type: str) -> bool:
+        now = time.time()
+        return (now - self._last_fired.get(event_type, 0.0)) >= self._cooldown
+
+    def _severity(self, event_type: str) -> str:
+        if event_type in self._CRITICAL:
+            return "critical"
+        if event_type in self._HIGH:
+            return "high"
+        return "medium"
+
+    def _loop(self) -> None:
+        while self._running:
+            try:
+                resp = requests.get(self._url, timeout=2)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for event in data.get("events", []):
+                        etype = event.get("event_type", "")
+                        if not etype:
+                            continue
+                        if not self._can_fire(etype):
+                            continue
+                        self._last_fired[etype] = time.time()
+                        self._alert_callback(
+                            event_type=etype,
+                            description=event.get("description", etype),
+                            confidence=float(event.get("confidence", 0.0)),
+                            severity=self._severity(etype),
+                        )
+            except requests.exceptions.ConnectionError:
+                pass   # server not up yet — silent retry
+            except Exception as exc:
+                print(f"[Surveillance] Poll error: {exc}")
+            time.sleep(self.POLL_INTERVAL)
+
 os.environ["LIBCAMERA_LOG_LEVELS"] = "*:ERROR"
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
@@ -92,6 +172,9 @@ class RuntimeSettings:
     display_enabled: bool = os.getenv("BUDDY_ENABLE_DISPLAY", "1") != "0"
     pc_camera_ip: str = os.getenv("BUDDY_PC_CAMERA_IP", "buddypc.local")
     pc_camera_port: int = 5000
+    surveillance_port: int = int(os.getenv("BUDDY_SURVEILLANCE_PORT", "8001"))
+    surveillance_enabled: bool = os.getenv("BUDDY_SURVEILLANCE_ENABLED", "1") != "0"
+    surveillance_cooldown: float = float(os.getenv("BUDDY_SURVEILLANCE_COOLDOWN", "30.0"))
 
 
 class BuddyIntegratedPi:
@@ -266,6 +349,16 @@ class BuddyIntegratedPi:
         self._bbox_fall_last_alert_time = 0.0
         self._blood_detect_started_at: Optional[float] = None
         self._blood_last_alert_time = 0.0
+
+        # Surveillance client — connects to PC surveillance server
+        self._surveillance_client: Optional[_SurveillanceClient] = None
+        if self.settings.surveillance_enabled:
+            self._surveillance_client = _SurveillanceClient(
+                pc_ip=self.settings.pc_camera_ip,
+                port=self.settings.surveillance_port,
+                alert_callback=self._on_surveillance_event,
+                cooldown=self.settings.surveillance_cooldown,
+            )
 
         self._behavior_pipeline = None
         if os.getenv("BUDDY_ENABLE_MEDIAPIPE_BEHAVIOR", "0") == "1":
@@ -1698,6 +1791,72 @@ class BuddyIntegratedPi:
             jpeg_bytes=jpeg_bytes,
         )
 
+    def _on_surveillance_event(
+        self,
+        event_type: str,
+        description: str,
+        confidence: float,
+        severity: str,
+    ) -> None:
+        """
+        Callback fired by _SurveillanceClient for every new MediaPipe event
+        detected on the PC surveillance server.
+
+        Routing:
+          critical  → full emergency response (Telegram + webhook + call command)
+          high      → alert channels only (Telegram)
+          medium    → spoken warning only
+        """
+        if self.sleep_mode or self._emergency_active:
+            return
+
+        reason = (
+            f"PC surveillance detected: {event_type} — {description} "
+            f"(confidence {confidence:.0%})"
+        )
+        print(f"[Surveillance] 🚨 {severity.upper()}: {reason}")
+
+        jpeg_bytes: Optional[bytes] = None
+        with self._stream_lock:
+            jpeg_bytes = self._stream_frame
+
+        # Spoken message map
+        _spoken: dict[str, str] = {
+            "fall":                  "Warning! Someone may have fallen!",
+            "person_down":           "Alert! A person appears to be lying on the floor.",
+            "hand_on_chest":         "Alert! Someone has their hand on their chest. Are you okay?",
+            "eyes_closed":           "Alert! Someone's eyes have been closed for a while.",
+            "trembling":             "Alert! Trembling detected. Are you okay?",
+            "head_tilt":             "Alert! Unusual head tilt detected. Please check.",
+            "hands_raised":          "I noticed your hands are raised. Do you need help?",
+            "prolonged_inactivity":  "I haven't seen you move for a while. Are you okay?",
+            "covering_face":         "I noticed you are covering your face. Are you alright?",
+            "head_drooping":         "Your head appears to be drooping. Are you okay?",
+            "clutching_stomach":     "I noticed you may be holding your stomach. Are you okay?",
+            "hunching":              "You seem to be hunching. Are you in pain?",
+            "crouching":             "I see you crouching. Is everything alright?",
+        }
+        spoken_msg = _spoken.get(event_type, f"Surveillance alert: {description}")
+
+        if severity == "critical":
+            if not self.is_speaking:
+                self.speak(spoken_msg)
+            self._trigger_emergency_response(reason)
+
+        elif severity == "high":
+            if not self.is_speaking:
+                self.speak(spoken_msg)
+            self._send_alert_channels(
+                label=event_type,
+                severity=severity,
+                reason=reason,
+                jpeg_bytes=jpeg_bytes,
+            )
+
+        else:  # medium
+            if not self.is_speaking:
+                self.speak(spoken_msg)
+
     def _on_obstacle(self):
         if not self.is_speaking:
             self.speak("Obstacle detected. I have stopped.")
@@ -2336,6 +2495,8 @@ class BuddyIntegratedPi:
         self._start_stream_server(port=8090)
         self._camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
         self._camera_thread.start()
+        if self._surveillance_client is not None:
+            self._surveillance_client.start()
         threading.Thread(target=self._startup_greeting, daemon=True).start()
         time.sleep(0.5)
         self._wake_loop()
@@ -2345,6 +2506,8 @@ class BuddyIntegratedPi:
             return
         self._cleaned_up = True
         self.running = False
+        if self._surveillance_client is not None:
+            self._surveillance_client.stop()
         if self.eyes:
             try:
                 self.eyes.stop()
