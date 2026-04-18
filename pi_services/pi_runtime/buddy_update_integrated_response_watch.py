@@ -138,6 +138,11 @@ class BuddyIntegratedPi:
     _SERVO_FACE_MIN_ANGLE = 30.0
     _SERVO_FACE_MAX_ANGLE = 150.0
     _SERVO_FACE_UPDATE_INTERVAL = 0.35
+    _BBOX_FALL_ASPECT_RATIO = 1.15
+    _BBOX_FALL_MIN_AREA_RATIO = 0.06
+    _BBOX_FALL_LOW_CENTER_RATIO = 0.55
+    _BBOX_FALL_CONFIRM_SECONDS = 2.0
+    _BBOX_FALL_ALERT_COOLDOWN_SECONDS = 120.0
     _OK_RESPONSES = (
         "yes", "yeah", "yep", "ok", "okay", "fine", "i am fine", "i'm fine",
         "all good", "i am okay", "i'm okay", "yes i am", "yes i'm ok",
@@ -243,18 +248,23 @@ class BuddyIntegratedPi:
         self.servo_enabled = False
         self._servo_face_last_update = 0.0
         self._servo_face_tracking_enabled = os.getenv("BUDDY_SERVO_FACE_TRACKING", "1") != "0"
+        self._bbox_fall_started_at: Optional[float] = None
+        self._bbox_fall_last_alert_time = 0.0
 
-        # behavior pipeline
-        self._behavior_pipeline = BehaviorDetectionPipeline(
-            config=PipelineConfig(
-                resize_width=224,
-                resize_height=224,
-                process_every_n_frames=3,
-                sequence_length=12,
-                enable_visualization=False,
-            ),
-            alert_callback=self._on_behavior_alert,
-        )
+        self._behavior_pipeline = None
+        if os.getenv("BUDDY_ENABLE_MEDIAPIPE_BEHAVIOR", "0") == "1":
+            self._behavior_pipeline = BehaviorDetectionPipeline(
+                config=PipelineConfig(
+                    resize_width=224,
+                    resize_height=224,
+                    process_every_n_frames=3,
+                    sequence_length=12,
+                    enable_visualization=False,
+                ),
+                alert_callback=self._on_behavior_alert,
+            )
+        else:
+            self.logger.info("MediaPipe behavior pipeline disabled; using Pi-safe bbox fall detector.")
 
         self.aplay_device, self.usb_card_index = self._find_output_audio_device()
         self.arecord_device = self._find_input_audio_device()
@@ -1802,6 +1812,91 @@ class BuddyIntegratedPi:
             for det in self.current_detections
         )
 
+    def _largest_person_bbox(self) -> Optional[tuple[float, float, float, float]]:
+        person_boxes = []
+        for det in self.current_detections:
+            if not isinstance(det, dict) or det.get("name") != "person":
+                continue
+            box = det.get("bbox") or det.get("box") or det.get("xyxy")
+            if not box or len(box) < 4:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in box[:4]]
+            width = max(0.0, x2 - x1)
+            height = max(0.0, y2 - y1)
+            area = width * height
+            if area > 0:
+                person_boxes.append((area, x1, y1, x2, y2))
+        if not person_boxes:
+            return None
+        _, x1, y1, x2, y2 = max(person_boxes, key=lambda item: item[0])
+        return x1, y1, x2, y2
+
+    def _update_bbox_fall_monitor(self, frame: np.ndarray):
+        if os.getenv("BUDDY_ENABLE_BBOX_FALL_DETECTION", "1") == "0":
+            return
+        if self.sleep_mode or self._emergency_active:
+            return
+
+        bbox = self._largest_person_bbox()
+        if bbox is None:
+            self._bbox_fall_started_at = None
+            return
+
+        frame_h, frame_w = frame.shape[:2]
+        frame_area = float(max(1, frame_w * frame_h))
+        x1, y1, x2, y2 = bbox
+        width = max(1.0, x2 - x1)
+        height = max(1.0, y2 - y1)
+        aspect_ratio = width / height
+        area_ratio = (width * height) / frame_area
+        center_y_ratio = ((y1 + y2) / 2.0) / max(1.0, float(frame_h))
+
+        fall_aspect = float(os.getenv("BUDDY_BBOX_FALL_ASPECT_RATIO", self._BBOX_FALL_ASPECT_RATIO))
+        min_area = float(os.getenv("BUDDY_BBOX_FALL_MIN_AREA_RATIO", self._BBOX_FALL_MIN_AREA_RATIO))
+        low_center = float(os.getenv("BUDDY_BBOX_FALL_LOW_CENTER_RATIO", self._BBOX_FALL_LOW_CENTER_RATIO))
+        confirm_seconds = float(os.getenv("BUDDY_BBOX_FALL_CONFIRM_SECONDS", self._BBOX_FALL_CONFIRM_SECONDS))
+        cooldown = float(os.getenv("BUDDY_BBOX_FALL_ALERT_COOLDOWN_SECONDS", self._BBOX_FALL_ALERT_COOLDOWN_SECONDS))
+
+        looks_fallen = (
+            aspect_ratio >= fall_aspect
+            and area_ratio >= min_area
+            and center_y_ratio >= low_center
+        )
+        now = time.time()
+        if not looks_fallen:
+            self._bbox_fall_started_at = None
+            return
+
+        if self._bbox_fall_started_at is None:
+            self._bbox_fall_started_at = now
+            return
+
+        if now - self._bbox_fall_started_at < confirm_seconds:
+            return
+        if now - self._bbox_fall_last_alert_time < cooldown:
+            return
+
+        self._bbox_fall_last_alert_time = now
+        reason = (
+            "Pi-safe bbox fall detector: person appears horizontal/low "
+            f"for {now - self._bbox_fall_started_at:.1f}s "
+            f"(aspect={aspect_ratio:.2f}, area={area_ratio:.2f}, center_y={center_y_ratio:.2f})"
+        )
+        print(f"[Behavior] BBox fall alert: {reason}")
+        jpeg_bytes = None
+        with self._stream_lock:
+            jpeg_bytes = self._stream_frame
+
+        if not self.is_speaking:
+            self.speak("Warning. Someone may have fallen.")
+
+        self._send_alert_channels(
+            label="fall_detected",
+            severity="high",
+            reason=reason,
+            jpeg_bytes=jpeg_bytes,
+        )
+
     def _update_behavior_monitor(self, frame: np.ndarray):
         if os.getenv("BUDDY_ENABLE_VISUAL_SAFETY", "1") == "0":
             return
@@ -1950,11 +2045,12 @@ class BuddyIntegratedPi:
 
             if self.frame_count % 10 == 0:
                 self._update_behavior_monitor(frame)
+                self._update_bbox_fall_monitor(frame)
                 self._update_follow_mode(frame)
                 self._update_servo_face_tracking(frame)
 
             # pose-based behavior pipeline every 3rd frame
-            if self.frame_count % 3 == 0:
+            if self._behavior_pipeline is not None and self.frame_count % 3 == 0:
                 try:
                     result = self._behavior_pipeline.process_frame(frame)
                     if result.get("frame_processed") and result.get("person_detected"):
