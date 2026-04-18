@@ -621,7 +621,7 @@ class BuddyIntegratedPi:
         speech_thresh = 0.005
         silence_after = 0.4
         min_speech = 0.1
-        max_duration = float(os.getenv("BUDDY_RESPONSE_LISTEN_MAX", "30.0"))
+        max_duration = float(os.getenv("BUDDY_RESPONSE_LISTEN_MAX", "8.0"))
         initial_wait_timeout = self._listen_initial_timeout
 
         # use cached device — skip probe after first successful use
@@ -712,6 +712,10 @@ class BuddyIntegratedPi:
             return ""
 
         audio_16k = resample_poly(audio, 16000, 48000).astype(np.float32)
+        # cap to 8s at 16kHz to avoid websocket size limit
+        max_samples = 16000 * 8
+        if len(audio_16k) > max_samples:
+            audio_16k = audio_16k[:max_samples]
         uri = f"ws://{self.settings.stt_server_ip}:{self.settings.stt_port}"
         try:
             async with websockets.connect(uri) as websocket:
@@ -917,14 +921,14 @@ class BuddyIntegratedPi:
         normalized = self._normalize_heard_text(text)
         if not normalized:
             return False
+        if len(normalized.split()) > 6:
+            return False
         if any(phrase in normalized for phrase in self._WAKE_WORDS):
             return True
-
         tokens = normalized.split()
-        if "buddy" in tokens:
+        if tokens == ["buddy"]:
             return True
-
-        common_variants = ("budy", "baddi", "body", "buddhi")
+        common_variants = ("budy", "baddi", "buddhi")
         return any(token in common_variants for token in tokens)
 
     def _handle_passive_emergency_phrase(self, source: str, text: str):
@@ -1044,15 +1048,6 @@ class BuddyIntegratedPi:
             daemon=True,
         ).start()
 
-        whatsapp_numbers = self._get_whatsapp_family_numbers()
-        if whatsapp_numbers:
-            threading.Thread(
-                target=self._send_whatsapp_family_alert,
-                args=(message, reason, whatsapp_numbers),
-                daemon=True,
-            ).start()
-        else:
-            print("[Alert] No BUDDY_FAMILY_WHATSAPP_NUMBERS configured.")
 
     def _get_whatsapp_family_numbers(self) -> list[str]:
         raw_numbers = os.getenv("BUDDY_FAMILY_WHATSAPP_NUMBERS", "").split(",")
