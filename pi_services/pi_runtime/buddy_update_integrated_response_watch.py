@@ -83,7 +83,7 @@ class RuntimeSettings:
     stt_server_ip: str = os.getenv("BUDDY_STT_SERVER_IP", "buddypc.local")
     stt_port: int = int(os.getenv("BUDDY_STT_PORT", "8765"))
     notification_port: int = int(os.getenv("BUDDY_NOTIFICATION_PORT", "8001"))
-    arduino_port: str = os.getenv("BUDDY_ARDUINO_PORT", "/dev/ttyUSB0")
+    arduino_port: str = os.getenv("BUDDY_ARDUINO_PORT", "").strip()
     arduino_baud: int = int(os.getenv("BUDDY_ARDUINO_BAUD", "115200"))
     use_servo: bool = True
     recognition_interval: float = 5.0
@@ -294,12 +294,20 @@ class BuddyIntegratedPi:
         self._init_camera()
         self.stability = StabilityTracker(self.config)
         self._init_local_vision()
+        motor_port = self.settings.arduino_port or None
         self.motors = MotorController(
-            port=self.settings.arduino_port,
+            port=motor_port,
             baud=self.settings.arduino_baud,
         )
         self.motors.set_obstacle_callback(self._on_obstacle)
         self.motors.set_clear_callback(self._on_clear_path)
+        if self.motors.is_connected():
+            chosen_port = getattr(getattr(self.motors, "_ser", None), "port", motor_port or "auto-detect")
+            self.logger.info("Motor controller connected on %s @ %s baud", chosen_port, self.settings.arduino_baud)
+        else:
+            self.logger.warning(
+                "Motor controller not connected. Set BUDDY_ARDUINO_PORT if auto-detect did not find your Arduino."
+            )
         self._init_servo()
 
         self.tts_voice = "en-IN-NeerjaNeural"
