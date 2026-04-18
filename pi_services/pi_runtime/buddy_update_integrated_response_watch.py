@@ -143,6 +143,11 @@ class BuddyIntegratedPi:
     _BBOX_FALL_LOW_CENTER_RATIO = 0.48
     _BBOX_FALL_CONFIRM_SECONDS = 1.2
     _BBOX_FALL_ALERT_COOLDOWN_SECONDS = 90.0
+    _BLOOD_MIN_REGION_RATIO = 0.008
+    _BLOOD_MIN_SATURATION = 105
+    _BLOOD_MIN_VALUE = 35
+    _BLOOD_CONFIRM_SECONDS = 1.5
+    _BLOOD_ALERT_COOLDOWN_SECONDS = 180.0
     _OK_RESPONSES = (
         "yes", "yeah", "yep", "ok", "okay", "fine", "i am fine", "i'm fine",
         "all good", "i am okay", "i'm okay", "yes i am", "yes i'm ok",
@@ -252,6 +257,8 @@ class BuddyIntegratedPi:
         self._servo_face_tracking_enabled = os.getenv("BUDDY_SERVO_FACE_TRACKING", "1") != "0"
         self._bbox_fall_started_at: Optional[float] = None
         self._bbox_fall_last_alert_time = 0.0
+        self._blood_detect_started_at: Optional[float] = None
+        self._blood_last_alert_time = 0.0
 
         self._behavior_pipeline = None
         if os.getenv("BUDDY_ENABLE_MEDIAPIPE_BEHAVIOR", "0") == "1":
@@ -1899,6 +1906,96 @@ class BuddyIntegratedPi:
             jpeg_bytes=jpeg_bytes,
         )
 
+    def _update_blood_monitor(self, frame: np.ndarray):
+        """Detect blood-like red pooling as a low-confidence visual risk signal."""
+        if os.getenv("BUDDY_ENABLE_BLOOD_HEURISTIC", "1") == "0":
+            return
+        if self.sleep_mode or self._emergency_active:
+            return
+
+        roi = frame
+        bbox = self._largest_person_bbox()
+        if bbox is not None:
+            frame_h, frame_w = frame.shape[:2]
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            pad_x = int((x2 - x1) * 0.25)
+            pad_y = int((y2 - y1) * 0.25)
+            x1 = max(0, x1 - pad_x)
+            y1 = max(0, y1 - pad_y)
+            x2 = min(frame_w, x2 + pad_x)
+            y2 = min(frame_h, y2 + pad_y)
+            if x2 > x1 and y2 > y1:
+                roi = frame[y1:y2, x1:x2]
+
+        if roi.size == 0:
+            self._blood_detect_started_at = None
+            return
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        sat_min = int(os.getenv("BUDDY_BLOOD_MIN_SATURATION", str(self._BLOOD_MIN_SATURATION)))
+        val_min = int(os.getenv("BUDDY_BLOOD_MIN_VALUE", str(self._BLOOD_MIN_VALUE)))
+
+        lower_red_1 = np.array([0, sat_min, val_min], dtype=np.uint8)
+        upper_red_1 = np.array([12, 255, 255], dtype=np.uint8)
+        lower_red_2 = np.array([165, sat_min, val_min], dtype=np.uint8)
+        upper_red_2 = np.array([180, 255, 255], dtype=np.uint8)
+
+        mask = cv2.inRange(hsv, lower_red_1, upper_red_1) | cv2.inRange(hsv, lower_red_2, upper_red_2)
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        red_ratio = float(np.count_nonzero(mask)) / float(mask.size)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        largest_contour_area = max((cv2.contourArea(contour) for contour in contours), default=0.0)
+        contour_ratio = largest_contour_area / float(max(1, roi.shape[0] * roi.shape[1]))
+        redness_strength = float(np.mean(hsv[:, :, 1][mask > 0])) if np.any(mask) else 0.0
+
+        min_ratio = float(os.getenv("BUDDY_BLOOD_MIN_REGION_RATIO", str(self._BLOOD_MIN_REGION_RATIO)))
+        looks_blood_like = (
+            red_ratio >= min_ratio
+            and contour_ratio >= (min_ratio * 0.4)
+            and redness_strength >= max(sat_min, 100)
+            and self._person_or_face_visible()
+        )
+
+        now = time.time()
+        if not looks_blood_like:
+            self._blood_detect_started_at = None
+            return
+
+        if self._blood_detect_started_at is None:
+            self._blood_detect_started_at = now
+            return
+
+        confirm_seconds = float(os.getenv("BUDDY_BLOOD_CONFIRM_SECONDS", str(self._BLOOD_CONFIRM_SECONDS)))
+        cooldown = float(os.getenv("BUDDY_BLOOD_ALERT_COOLDOWN_SECONDS", str(self._BLOOD_ALERT_COOLDOWN_SECONDS)))
+        if (now - self._blood_detect_started_at) < confirm_seconds:
+            return
+        if (now - self._blood_last_alert_time) < cooldown:
+            return
+
+        self._blood_last_alert_time = now
+        reason = (
+            "Experimental blood-like scene heuristic triggered "
+            f"(red_ratio={red_ratio:.3f}, contour_ratio={contour_ratio:.3f}, "
+            f"redness={redness_strength:.1f}). This is not a medical diagnosis."
+        )
+        print(f"[Behavior] Blood-like alert: {reason}")
+        jpeg_bytes = None
+        with self._stream_lock:
+            jpeg_bytes = self._stream_frame
+
+        if not self.is_speaking:
+            self.speak("Warning. I can see a possible blood-like scene. Please check immediately.")
+
+        self._send_alert_channels(
+            label="possible_blood_detected",
+            severity="high",
+            reason=reason,
+            jpeg_bytes=jpeg_bytes,
+        )
+
     def _update_behavior_monitor(self, frame: np.ndarray):
         if os.getenv("BUDDY_ENABLE_VISUAL_SAFETY", "1") == "0":
             return
@@ -2048,6 +2145,7 @@ class BuddyIntegratedPi:
             if self.frame_count % 10 == 0:
                 self._update_behavior_monitor(frame)
                 self._update_bbox_fall_monitor(frame)
+                self._update_blood_monitor(frame)
                 self._update_follow_mode(frame)
                 self._update_servo_face_tracking(frame)
 
