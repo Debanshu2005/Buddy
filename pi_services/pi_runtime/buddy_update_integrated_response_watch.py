@@ -208,13 +208,13 @@ class BuddyIntegratedPi:
         "One moment.",
         "Thinking.",
     )
-    _RESPONSE_DELAY_MIN_SAMPLES = 3
-    _RESPONSE_DELAY_RATIO = 1.5
-    _RESPONSE_DELAY_SECONDS = 5.0
-    _RESPONSE_AVG_ALPHA = 0.25
-    _VOICE_WEAK_MIN_SAMPLES = 5
-    _VOICE_WEAK_RATIO = 0.55
-    _VOICE_AVG_ALPHA = 0.2
+    _RESPONSE_DELAY_MIN_SAMPLES = 5
+    _RESPONSE_DELAY_RATIO = 2.0
+    _RESPONSE_DELAY_SECONDS = 8.0
+    _RESPONSE_AVG_ALPHA = 0.2
+    _VOICE_WEAK_MIN_SAMPLES = 10
+    _VOICE_WEAK_RATIO = 0.35
+    _VOICE_AVG_ALPHA = 0.15
     _VISUAL_STILLNESS_SECONDS = 75.0
     _VISUAL_CHECK_COOLDOWN_SECONDS = 120.0
     _VISUAL_MOTION_THRESHOLD = 1.5
@@ -814,16 +814,23 @@ class BuddyIntegratedPi:
             return ""
 
         audio_16k = resample_poly(audio, 16000, 48000).astype(np.float32)
-        # cap to 8s at 16kHz to avoid websocket size limit
         max_samples = 16000 * 8
         if len(audio_16k) > max_samples:
             audio_16k = audio_16k[:max_samples]
         uri = f"ws://{self.settings.stt_server_ip}:{self.settings.stt_port}"
         try:
-            async with websockets.connect(uri) as websocket:
+            async with websockets.connect(
+                uri,
+                ping_interval=None,   # disable keepalive pings — Whisper transcription takes time
+                open_timeout=5,
+                close_timeout=5,
+            ) as websocket:
                 await websocket.send(audio_16k.tobytes())
-                result = await websocket.recv()
+                result = await asyncio.wait_for(websocket.recv(), timeout=30.0)
                 return result.strip() if result else ""
+        except asyncio.TimeoutError:
+            self.logger.warning("STT timed out waiting for transcription")
+            return ""
         except Exception as exc:
             self.logger.warning("STT websocket failed: %s", exc)
             return ""
@@ -1107,6 +1114,13 @@ class BuddyIntegratedPi:
                 args=(call_command, message),
                 daemon=True,
             ).start()
+
+        # Reset after 5 minutes so the robot can respond again
+        def _reset():
+            time.sleep(300)
+            self._emergency_active = False
+            print("[EMERGENCY] Emergency state reset — robot is responsive again.")
+        threading.Thread(target=_reset, daemon=True).start()
 
     def _send_emergency_webhook(self, webhook_url: str, message: str, contacts: list[str]):
         try:
@@ -2516,10 +2530,12 @@ class BuddyIntegratedPi:
             response_elapsed = time.monotonic() - listen_started
             voice_stats = dict(self._last_voice_stats)
             self._eye(EyeState.IDLE)
-            if not self._check_response_delay_and_confirm(response_elapsed):
-                self._wait_for_tts()
-                continue
+
+            # Only run wellness checks when we actually got speech
             if user_text:
+                if not self._check_response_delay_and_confirm(response_elapsed):
+                    self._wait_for_tts()
+                    continue
                 if not self._check_weak_voice_and_confirm(voice_stats):
                     self._wait_for_tts()
                     continue
