@@ -128,6 +128,11 @@ class BuddyIntegratedPi:
     _VISUAL_STILLNESS_SECONDS = 120.0
     _VISUAL_CHECK_COOLDOWN_SECONDS = 180.0
     _VISUAL_MOTION_THRESHOLD = 2.0
+    _FOLLOW_TARGET_AREA_RATIO = 0.08
+    _FOLLOW_TOO_CLOSE_AREA_RATIO = 0.22
+    _FOLLOW_CENTER_TOLERANCE = 0.18
+    _FOLLOW_COMMAND_INTERVAL = 0.35
+    _FOLLOW_LOST_TIMEOUT = 2.5
     _OK_RESPONSES = (
         "yes", "yeah", "yep", "ok", "okay", "fine", "i am fine", "i'm fine",
         "all good", "i am okay", "i'm okay", "yes i am", "yes i'm ok",
@@ -217,6 +222,10 @@ class BuddyIntegratedPi:
         self._last_visual_check_time = 0.0
         self._visual_check_active = False
         self._pause_wake_listening = False
+        self.follow_mode = False
+        self._follow_last_command = "S"
+        self._follow_last_command_time = 0.0
+        self._follow_last_seen_time = 0.0
         self._load_response_time_stats()
         self.servo = None
         self.servo_enabled = False
@@ -1142,13 +1151,23 @@ class BuddyIntegratedPi:
 
         # 1. Stop
         if self._is_stop_command(lowered):
+            self.follow_mode = False
             self.motors.stop()
             self.speak("Stopped.")
+            return
+
+        # 2. Follow mode
+        if any(p in lowered for p in ("follow me", "come with me", "track me")):
+            self._start_follow_mode()
+            return
+        if any(p in lowered for p in ("stop following", "don't follow", "do not follow")):
+            self._stop_follow_mode()
             return
 
         # 2. Move
         movement = self._parse_movement(lowered)
         if movement is not None:
+            self.follow_mode = False
             cmd, duration = movement
             self.motors.move(cmd, duration)
             self.speak(self._MOTOR_CONFIRMATIONS.get(cmd, "On it."))
@@ -1467,7 +1486,10 @@ class BuddyIntegratedPi:
                     2,
                 )
 
-        status = f"Chatting with: {self.active_user}" if self.active_user else "Looking for people..."
+        if self.follow_mode:
+            status = "Follow mode active"
+        else:
+            status = f"Chatting with: {self.active_user}" if self.active_user else "Looking for people..."
         cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         return frame
 
@@ -1588,6 +1610,97 @@ class BuddyIntegratedPi:
     def _on_clear_path(self):
         if not self.is_speaking:
             self.speak("Path is clear.")
+
+    def _start_follow_mode(self):
+        if not self.motors.is_connected():
+            self.speak("I cannot follow right now because the motors are not connected.")
+            return
+        self.follow_mode = True
+        self._follow_last_command = "S"
+        self._follow_last_command_time = 0.0
+        self._follow_last_seen_time = time.time()
+        self.speak("Okay, I will follow you. Say stop when you want me to stop.")
+
+    def _stop_follow_mode(self):
+        self.follow_mode = False
+        self._follow_last_command = "S"
+        self.motors.stop()
+        self.speak("Okay, I stopped following.")
+
+    def _get_follow_target(self, frame: np.ndarray) -> Optional[tuple[float, float, float]]:
+        frame_h, frame_w = frame.shape[:2]
+        frame_area = float(max(1, frame_w * frame_h))
+
+        if self.last_faces:
+            x, y, w, h = max(self.last_faces, key=lambda box: box[2] * box[3])
+            return ((x + w / 2.0) / frame_w, (w * h) / frame_area, float(w * h))
+
+        person_boxes = []
+        for det in self.current_detections:
+            if not isinstance(det, dict) or det.get("name") != "person":
+                continue
+            box = det.get("box") or det.get("bbox") or det.get("xyxy")
+            if not box or len(box) < 4:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in box[:4]]
+            width = max(0.0, x2 - x1)
+            height = max(0.0, y2 - y1)
+            area = width * height
+            if area > 0:
+                person_boxes.append((x1, y1, width, height, area))
+
+        if not person_boxes:
+            return None
+
+        x, y, w, h, area = max(person_boxes, key=lambda box: box[4])
+        return ((x + w / 2.0) / frame_w, area / frame_area, area)
+
+    def _send_follow_command(self, cmd: str, duration: Optional[float] = None):
+        now = time.time()
+        if cmd == self._follow_last_command and (now - self._follow_last_command_time) < self._FOLLOW_COMMAND_INTERVAL:
+            return
+        self._follow_last_command = cmd
+        self._follow_last_command_time = now
+        if cmd == "S":
+            self.motors.stop()
+        else:
+            self.motors.move(cmd, duration)
+
+    def _update_follow_mode(self, frame: np.ndarray):
+        if not self.follow_mode or self.sleep_mode or self._emergency_active:
+            return
+        if not self.motors.is_connected():
+            self.follow_mode = False
+            self.motors.stop()
+            return
+
+        target = self._get_follow_target(frame)
+        if target is None:
+            if time.time() - self._follow_last_seen_time > self._FOLLOW_LOST_TIMEOUT:
+                self._send_follow_command("S")
+            return
+
+        self._follow_last_seen_time = time.time()
+        center_x, area_ratio, _ = target
+        error_x = center_x - 0.5
+
+        center_tolerance = float(os.getenv("BUDDY_FOLLOW_CENTER_TOLERANCE", self._FOLLOW_CENTER_TOLERANCE))
+        target_area = float(os.getenv("BUDDY_FOLLOW_TARGET_AREA_RATIO", self._FOLLOW_TARGET_AREA_RATIO))
+        too_close_area = float(os.getenv("BUDDY_FOLLOW_TOO_CLOSE_AREA_RATIO", self._FOLLOW_TOO_CLOSE_AREA_RATIO))
+
+        if abs(error_x) > center_tolerance:
+            self._send_follow_command("R" if error_x > 0 else "L", 0.25)
+            return
+
+        if area_ratio < target_area:
+            self._send_follow_command("F", 0.45)
+            return
+
+        if area_ratio > too_close_area:
+            self._send_follow_command("B", 0.25)
+            return
+
+        self._send_follow_command("S")
 
     def _person_or_face_visible(self) -> bool:
         if self.last_faces:
@@ -1745,6 +1858,7 @@ class BuddyIntegratedPi:
 
             if self.frame_count % 10 == 0:
                 self._update_behavior_monitor(frame)
+                self._update_follow_mode(frame)
 
             # pose-based behavior pipeline every 3rd frame
             if self.frame_count % 3 == 0:
