@@ -125,24 +125,24 @@ class BuddyIntegratedPi:
     _VOICE_WEAK_MIN_SAMPLES = 5
     _VOICE_WEAK_RATIO = 0.55
     _VOICE_AVG_ALPHA = 0.2
-    _VISUAL_STILLNESS_SECONDS = 120.0
-    _VISUAL_CHECK_COOLDOWN_SECONDS = 180.0
-    _VISUAL_MOTION_THRESHOLD = 2.0
+    _VISUAL_STILLNESS_SECONDS = 75.0
+    _VISUAL_CHECK_COOLDOWN_SECONDS = 120.0
+    _VISUAL_MOTION_THRESHOLD = 1.5
     _FOLLOW_TARGET_AREA_RATIO = 0.08
     _FOLLOW_TOO_CLOSE_AREA_RATIO = 0.22
     _FOLLOW_CENTER_TOLERANCE = 0.18
     _FOLLOW_COMMAND_INTERVAL = 0.35
     _FOLLOW_LOST_TIMEOUT = 2.5
-    _SERVO_FACE_CENTER_TOLERANCE = 0.08
-    _SERVO_FACE_GAIN = 35.0
+    _SERVO_FACE_CENTER_TOLERANCE = 0.05
+    _SERVO_FACE_GAIN = 48.0
     _SERVO_FACE_MIN_ANGLE = 30.0
     _SERVO_FACE_MAX_ANGLE = 150.0
-    _SERVO_FACE_UPDATE_INTERVAL = 0.35
-    _BBOX_FALL_ASPECT_RATIO = 1.15
-    _BBOX_FALL_MIN_AREA_RATIO = 0.06
-    _BBOX_FALL_LOW_CENTER_RATIO = 0.55
-    _BBOX_FALL_CONFIRM_SECONDS = 2.0
-    _BBOX_FALL_ALERT_COOLDOWN_SECONDS = 120.0
+    _SERVO_FACE_UPDATE_INTERVAL = 0.12
+    _BBOX_FALL_ASPECT_RATIO = 0.95
+    _BBOX_FALL_MIN_AREA_RATIO = 0.04
+    _BBOX_FALL_LOW_CENTER_RATIO = 0.48
+    _BBOX_FALL_CONFIRM_SECONDS = 1.2
+    _BBOX_FALL_ALERT_COOLDOWN_SECONDS = 90.0
     _OK_RESPONSES = (
         "yes", "yeah", "yep", "ok", "okay", "fine", "i am fine", "i'm fine",
         "all good", "i am okay", "i'm okay", "yes i am", "yes i'm ok",
@@ -157,7 +157,9 @@ class BuddyIntegratedPi:
         "call my family", "call someone", "call emergency", "call ambulance",
         "i fell", "i have fallen", "i am hurt", "i'm hurt", "chest pain",
         "can't breathe", "cannot breathe", "hard to breathe", "feel dizzy",
-        "i feel dizzy", "i feel sick",
+        "i feel dizzy", "i feel sick", "i am not feeling safe",
+        "i'm not feeling safe", "i do not feel safe", "i don't feel safe",
+        "i am unsafe", "i'm unsafe", "not safe", "unsafe",
     )
 
     # emotion string from LLM -> (EyeState, servo_action, motor_cmd)
@@ -257,7 +259,7 @@ class BuddyIntegratedPi:
                 config=PipelineConfig(
                     resize_width=224,
                     resize_height=224,
-                    process_every_n_frames=3,
+                    process_every_n_frames=2,
                     sequence_length=12,
                     enable_visualization=False,
                 ),
@@ -306,7 +308,7 @@ class BuddyIntegratedPi:
             return
         try:
             from hardware.servo_controller import ServoController
-            self.servo = ServoController()
+            self.servo = ServoController(move_on_start=False)
             self.servo_enabled = bool(getattr(self.servo, "_pwm", None))
             if self.servo_enabled:
                 self.logger.info("Servo initialized")
