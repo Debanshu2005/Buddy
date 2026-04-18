@@ -80,11 +80,12 @@ class _SurveillanceClient:
         "clutching_stomach", "hunching", "crouching",
     }
 
-    def __init__(self, pc_ip: str, port: int, alert_callback, cooldown: float = 30.0):
+    def __init__(self, pc_ip: str, port: int, alert_callback, cooldown: float = 120.0):
         self._url = f"http://{pc_ip}:{port}/latest"
         self._alert_callback = alert_callback
         self._cooldown = cooldown
         self._last_fired: dict[str, float] = {}
+        self._seen_timestamps: set[float] = set()   # deduplicate by event timestamp
         self._thread: threading.Thread | None = None
         self._running = False
 
@@ -118,6 +119,14 @@ class _SurveillanceClient:
                         etype = event.get("event_type", "")
                         if not etype:
                             continue
+                        # deduplicate — same timestamp means same detection instance
+                        ts = float(event.get("timestamp", 0.0))
+                        if ts in self._seen_timestamps:
+                            continue
+                        self._seen_timestamps.add(ts)
+                        # keep seen_timestamps from growing forever
+                        if len(self._seen_timestamps) > 500:
+                            self._seen_timestamps = set(list(self._seen_timestamps)[-200:])
                         if not self._can_fire(etype):
                             continue
                         self._last_fired[etype] = time.time()
@@ -174,7 +183,7 @@ class RuntimeSettings:
     pc_camera_port: int = 5000
     surveillance_port: int = int(os.getenv("BUDDY_SURVEILLANCE_PORT", "8001"))
     surveillance_enabled: bool = os.getenv("BUDDY_SURVEILLANCE_ENABLED", "1") != "0"
-    surveillance_cooldown: float = float(os.getenv("BUDDY_SURVEILLANCE_COOLDOWN", "30.0"))
+    surveillance_cooldown: float = float(os.getenv("BUDDY_SURVEILLANCE_COOLDOWN", "120.0"))
 
 
 class BuddyIntegratedPi:
@@ -1839,7 +1848,7 @@ class BuddyIntegratedPi:
             f"PC surveillance detected: {event_type} — {description} "
             f"(confidence {confidence:.0%})"
         )
-        print(f"[Surveillance] 🚨 {severity.upper()}: {reason}")
+        print(f"[Surveillance] 🚨 {severity.upper()} received on Pi: {event_type} | {description} ({confidence:.0%})")
 
         jpeg_bytes: Optional[bytes] = None
         with self._stream_lock:
