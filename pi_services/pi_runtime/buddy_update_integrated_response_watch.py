@@ -114,6 +114,9 @@ class BuddyIntegratedPi:
     _VOICE_WEAK_MIN_SAMPLES = 5
     _VOICE_WEAK_RATIO = 0.55
     _VOICE_AVG_ALPHA = 0.2
+    _VISUAL_STILLNESS_SECONDS = 120.0
+    _VISUAL_CHECK_COOLDOWN_SECONDS = 180.0
+    _VISUAL_MOTION_THRESHOLD = 2.0
     _OK_RESPONSES = (
         "yes", "yeah", "yep", "ok", "okay", "fine", "i am fine", "i'm fine",
         "all good", "i am okay", "i'm okay", "yes i am", "yes i'm ok",
@@ -198,6 +201,11 @@ class BuddyIntegratedPi:
         self._response_time_stats: dict[str, dict[str, float]] = {}
         self._emergency_active = False
         self._last_voice_stats: dict[str, float] = {}
+        self._previous_behavior_frame: Optional[np.ndarray] = None
+        self._last_motion_time = time.time()
+        self._last_visual_check_time = 0.0
+        self._visual_check_active = False
+        self._pause_wake_listening = False
         self._load_response_time_stats()
 
         self.aplay_device, self.usb_card_index = self._find_output_audio_device()
