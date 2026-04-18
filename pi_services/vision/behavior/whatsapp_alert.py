@@ -63,9 +63,9 @@ def send_whatsapp_alert(
 
     emoji = {"critical": "🚨", "high": "⚠️", "medium": "🔔"}.get(severity, "ℹ️")
     message = (
-        f"{emoji} *BUDDY ALERT*\n"
-        f"Event: `{label}`\n"
-        f"Severity: *{severity.upper()}*\n"
+        f"{emoji} BUDDY ALERT\n"
+        f"Event: {label}\n"
+        f"Severity: {severity.upper()}\n"
         f"Reason: {reason}"
     )
 
@@ -76,7 +76,7 @@ def send_whatsapp_alert(
         try:
             resp = requests.post(
                 f"https://api.telegram.org/bot{token}/sendPhoto",
-                data={"chat_id": chat_id, "caption": message, "parse_mode": "Markdown"},
+                data={"chat_id": chat_id, "caption": message},
                 files={"photo": ("snapshot.jpg", jpeg_bytes, "image/jpeg")},
                 timeout=15,
             )
@@ -91,7 +91,7 @@ def send_whatsapp_alert(
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+            data={"chat_id": chat_id, "text": message},
             timeout=15,
         )
         if resp.status_code == 200:
