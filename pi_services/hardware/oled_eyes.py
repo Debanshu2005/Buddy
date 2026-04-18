@@ -93,12 +93,24 @@ class OledEye:
         self._state  = EyeState.IDLE
         self._lock   = threading.Lock()
         self._stop   = threading.Event()
+        self._gaze_dx = 0
+        self._gaze_dy = 0
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def set_state(self, state: EyeState):
         with self._lock:
             self._state = state
+
+    def set_gaze(self, dx: int = 0, dy: int = 0):
+        """Set live pupil offset for face tracking."""
+        with self._lock:
+            self._gaze_dx = max(-10, min(10, int(dx)))
+            self._gaze_dy = max(-8, min(8, int(dy)))
+
+    def center_gaze(self):
+        """Return pupils to center."""
+        self.set_gaze(0, 0)
 
     def stop(self):
         self._stop.set()
@@ -115,6 +127,8 @@ class OledEye:
         while not self._stop.is_set():
             with self._lock:
                 state = self._state
+                gaze_dx = self._gaze_dx
+                gaze_dy = self._gaze_dy
 
             eye = _Eye()
 
@@ -206,6 +220,9 @@ class OledEye:
                     bob_dir *= -1
                 eye.cy += bob
                 eye.brow_y = -9
+
+            eye.pupil_dx = max(-12, min(12, eye.pupil_dx + gaze_dx))
+            eye.pupil_dy = max(-10, min(10, eye.pupil_dy + gaze_dy))
 
             # --- blink ---
             blink_timer += 0.05

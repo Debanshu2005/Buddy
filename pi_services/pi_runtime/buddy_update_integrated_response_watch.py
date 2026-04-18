@@ -163,7 +163,7 @@ class RuntimeSettings:
     stt_server_ip: str = os.getenv("BUDDY_STT_SERVER_IP", "buddypc.local")
     stt_port: int = int(os.getenv("BUDDY_STT_PORT", "8765"))
     notification_port: int = int(os.getenv("BUDDY_NOTIFICATION_PORT", "8001"))
-    arduino_port: str = os.getenv("BUDDY_ARDUINO_PORT", "/dev/ttyUSB0")
+    arduino_port: str = os.getenv("BUDDY_ARDUINO_PORT", "").strip()
     arduino_baud: int = int(os.getenv("BUDDY_ARDUINO_BAUD", "115200"))
     use_servo: bool = True
     recognition_interval: float = 5.0
@@ -228,6 +228,7 @@ class BuddyIntegratedPi:
     _SERVO_FACE_MIN_ANGLE = 30.0
     _SERVO_FACE_MAX_ANGLE = 150.0
     _SERVO_FACE_UPDATE_INTERVAL = 0.12
+    _EYE_TRACK_UPDATE_INTERVAL = 0.08
     _BBOX_FALL_ASPECT_RATIO = 0.95
     _BBOX_FALL_MIN_AREA_RATIO = 0.04
     _BBOX_FALL_LOW_CENTER_RATIO = 0.48
@@ -314,6 +315,7 @@ class BuddyIntegratedPi:
         self._last_logged_objects: tuple[str, ...] = ()
         self._thinking_token: Optional[str] = None
         self._camera_thread: Optional[threading.Thread] = None
+        self._keyboard_thread: Optional[threading.Thread] = None
         self._notif_queue: list[dict] = []
         self._notif_lock = threading.Lock()
         self.local_vision_enabled = False
@@ -340,6 +342,7 @@ class BuddyIntegratedPi:
         self._follow_last_command = "S"
         self._follow_last_command_time = 0.0
         self._follow_last_seen_time = 0.0
+        self._eye_track_last_update = 0.0
         self._load_response_time_stats()
         self.servo = None
         self.servo_enabled = False
@@ -384,12 +387,20 @@ class BuddyIntegratedPi:
         self._init_camera()
         self.stability = StabilityTracker(self.config)
         self._init_local_vision()
+        motor_port = self.settings.arduino_port or None
         self.motors = MotorController(
-            port=self.settings.arduino_port,
+            port=motor_port,
             baud=self.settings.arduino_baud,
         )
         self.motors.set_obstacle_callback(self._on_obstacle)
         self.motors.set_clear_callback(self._on_clear_path)
+        if self.motors.is_connected():
+            chosen_port = getattr(getattr(self.motors, "_ser", None), "port", motor_port or "auto-detect")
+            self.logger.info("Motor controller connected on %s @ %s baud", chosen_port, self.settings.arduino_baud)
+        else:
+            self.logger.warning(
+                "Motor controller not connected. Set BUDDY_ARDUINO_PORT if auto-detect did not find your Arduino."
+            )
         self._init_servo()
 
         self.tts_voice = "en-IN-NeerjaNeural"
@@ -1996,6 +2007,32 @@ class BuddyIntegratedPi:
         self._servo_face_last_update = now
         threading.Thread(target=self.servo.move_to, args=(new_angle, True), daemon=True).start()
 
+    def _update_eye_tracking(self, frame: np.ndarray):
+        """Drive OLED pupil position from the currently tracked face."""
+        if not self.eyes:
+            return
+
+        now = time.time()
+        if now - self._eye_track_last_update < self._EYE_TRACK_UPDATE_INTERVAL:
+            return
+
+        if not self.last_faces:
+            self.eyes.center_gaze()
+            self._eye_track_last_update = now
+            return
+
+        frame_h, frame_w = frame.shape[:2]
+        if frame_h <= 0 or frame_w <= 0:
+            return
+
+        x, y, w, h = max(self.last_faces, key=lambda box: box[2] * box[3])
+        error_x = ((x + (w / 2.0)) / frame_w) - 0.5
+        error_y = ((y + (h / 2.0)) / frame_h) - 0.5
+        gaze_dx = int(np.clip(error_x * 20.0, -8, 8))
+        gaze_dy = int(np.clip(error_y * 16.0, -6, 6))
+        self.eyes.set_gaze(gaze_dx, gaze_dy)
+        self._eye_track_last_update = now
+
     def _person_or_face_visible(self) -> bool:
         if self.last_faces:
             return True
@@ -2331,6 +2368,7 @@ class BuddyIntegratedPi:
                 self._update_blood_monitor(frame)
                 self._update_follow_mode(frame)
                 self._update_servo_face_tracking(frame)
+                self._update_eye_tracking(frame)
 
             # pose-based behavior pipeline every 3rd frame
             if self._behavior_pipeline is not None and self.frame_count % 3 == 0:
@@ -2405,6 +2443,50 @@ class BuddyIntegratedPi:
     def _startup_greeting(self):
         time.sleep(1.0)
         self.speak("Hey. I am Buddy. Call me anytime.")
+
+    def _handle_typed_input(self, text: str):
+        """Process terminal input through the same command path as speech."""
+        normalized = self._normalize_heard_text(text)
+        if not normalized:
+            return
+
+        if normalized in ("quit", "exit"):
+            self.speak("Shutting down.")
+            self.cleanup()
+            return
+
+        if self.sleep_mode and self._heard_wake_word(normalized):
+            self.sleep_mode = False
+            self._eye(EyeState.WAKING)
+            self.speak("I am awake. What can I do for you?")
+            self._wait_for_tts()
+            return
+
+        self._process_input(text)
+
+    def _keyboard_loop(self):
+        """Allow typed interaction from the terminal alongside voice input."""
+        while self.running:
+            try:
+                text = input("\nYou> ").strip()
+            except EOFError:
+                time.sleep(0.2)
+                continue
+            except Exception as exc:
+                self.logger.warning("Keyboard input failed: %s", exc)
+                time.sleep(0.5)
+                continue
+
+            if not text:
+                continue
+            print(f"[Typed] {text}")
+            self._handle_typed_input(text)
+
+    def _start_keyboard_listener(self):
+        if self._keyboard_thread and self._keyboard_thread.is_alive():
+            return
+        self._keyboard_thread = threading.Thread(target=self._keyboard_loop, daemon=True)
+        self._keyboard_thread.start()
 
     def _wake_loop(self):
         print("Waiting for 'Buddy'...")
@@ -2491,6 +2573,7 @@ class BuddyIntegratedPi:
     def run(self):
         self.running = True
         print("[Safety] Passive camera and emergency-phrase detection enabled. Wake word is not required for alerts.")
+        print("[Input] You can also type commands like 'follow me', 'stop following', or 'exit'.")
         self._start_phone_listener()
         self._start_stream_server(port=8090)
         self._camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
