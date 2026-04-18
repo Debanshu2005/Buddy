@@ -145,6 +145,7 @@ class BuddyIntegratedPi:
     _SERVO_FACE_MIN_ANGLE = 30.0
     _SERVO_FACE_MAX_ANGLE = 150.0
     _SERVO_FACE_UPDATE_INTERVAL = 0.12
+    _EYE_TRACK_UPDATE_INTERVAL = 0.08
     _BBOX_FALL_ASPECT_RATIO = 0.95
     _BBOX_FALL_MIN_AREA_RATIO = 0.04
     _BBOX_FALL_LOW_CENTER_RATIO = 0.48
@@ -257,6 +258,7 @@ class BuddyIntegratedPi:
         self._follow_last_command = "S"
         self._follow_last_command_time = 0.0
         self._follow_last_seen_time = 0.0
+        self._eye_track_last_update = 0.0
         self._load_response_time_stats()
         self.servo = None
         self.servo_enabled = False
@@ -1842,6 +1844,32 @@ class BuddyIntegratedPi:
         self._servo_face_last_update = now
         threading.Thread(target=self.servo.move_to, args=(new_angle, True), daemon=True).start()
 
+    def _update_eye_tracking(self, frame: np.ndarray):
+        """Drive OLED pupil position from the currently tracked face."""
+        if not self.eyes:
+            return
+
+        now = time.time()
+        if now - self._eye_track_last_update < self._EYE_TRACK_UPDATE_INTERVAL:
+            return
+
+        if not self.last_faces:
+            self.eyes.center_gaze()
+            self._eye_track_last_update = now
+            return
+
+        frame_h, frame_w = frame.shape[:2]
+        if frame_h <= 0 or frame_w <= 0:
+            return
+
+        x, y, w, h = max(self.last_faces, key=lambda box: box[2] * box[3])
+        error_x = ((x + (w / 2.0)) / frame_w) - 0.5
+        error_y = ((y + (h / 2.0)) / frame_h) - 0.5
+        gaze_dx = int(np.clip(error_x * 20.0, -8, 8))
+        gaze_dy = int(np.clip(error_y * 16.0, -6, 6))
+        self.eyes.set_gaze(gaze_dx, gaze_dy)
+        self._eye_track_last_update = now
+
     def _person_or_face_visible(self) -> bool:
         if self.last_faces:
             return True
@@ -2177,6 +2205,7 @@ class BuddyIntegratedPi:
                 self._update_blood_monitor(frame)
                 self._update_follow_mode(frame)
                 self._update_servo_face_tracking(frame)
+                self._update_eye_tracking(frame)
 
             # pose-based behavior pipeline every 3rd frame
             if self._behavior_pipeline is not None and self.frame_count % 3 == 0:
