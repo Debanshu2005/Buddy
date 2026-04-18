@@ -51,7 +51,7 @@ from hardware.oled_eyes import OledEyes, EyeState
 from memory.pi_memory import delete_person
 from phone_link.core import process_notification
 from vision.behavior.pipeline import BehaviorDetectionPipeline, PipelineConfig
-from vision.behavior.whatsapp_alert import send_whatsapp_alert
+from vision.behavior.whatsapp_alert import send_whatsapp_alert as send_telegram_alert
 
 os.environ["LIBCAMERA_LOG_LEVELS"] = "*:ERROR"
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
@@ -133,6 +133,11 @@ class BuddyIntegratedPi:
     _FOLLOW_CENTER_TOLERANCE = 0.18
     _FOLLOW_COMMAND_INTERVAL = 0.35
     _FOLLOW_LOST_TIMEOUT = 2.5
+    _SERVO_FACE_CENTER_TOLERANCE = 0.08
+    _SERVO_FACE_GAIN = 35.0
+    _SERVO_FACE_MIN_ANGLE = 30.0
+    _SERVO_FACE_MAX_ANGLE = 150.0
+    _SERVO_FACE_UPDATE_INTERVAL = 0.35
     _OK_RESPONSES = (
         "yes", "yeah", "yep", "ok", "okay", "fine", "i am fine", "i'm fine",
         "all good", "i am okay", "i'm okay", "yes i am", "yes i'm ok",
@@ -141,6 +146,13 @@ class BuddyIntegratedPi:
         "no", "nope", "not ok", "not okay", "help", "help me", "emergency",
         "call someone", "call family", "call emergency", "i need help",
         "i am not okay", "i'm not okay", "hurt", "pain",
+    )
+    _EMERGENCY_PHRASES = (
+        "emergency", "help me", "i need help", "call family",
+        "call my family", "call someone", "call emergency", "call ambulance",
+        "i fell", "i have fallen", "i am hurt", "i'm hurt", "chest pain",
+        "can't breathe", "cannot breathe", "hard to breathe", "feel dizzy",
+        "i feel dizzy", "i feel sick",
     )
 
     # emotion string from LLM -> (EyeState, servo_action, motor_cmd)
@@ -229,6 +241,8 @@ class BuddyIntegratedPi:
         self._load_response_time_stats()
         self.servo = None
         self.servo_enabled = False
+        self._servo_face_last_update = 0.0
+        self._servo_face_tracking_enabled = os.getenv("BUDDY_SERVO_FACE_TRACKING", "1") != "0"
 
         # behavior pipeline
         self._behavior_pipeline = BehaviorDetectionPipeline(
@@ -859,6 +873,16 @@ class BuddyIntegratedPi:
         lowered = text.lower().strip()
         return any(phrase in lowered for phrase in self._NOT_OK_RESPONSES)
 
+    def _is_emergency_phrase(self, text: str) -> bool:
+        lowered = text.lower().strip()
+        return any(phrase in lowered for phrase in self._EMERGENCY_PHRASES)
+
+    def _handle_passive_emergency_phrase(self, source: str, text: str):
+        self.follow_mode = False
+        self.motors.stop()
+        self._trigger_emergency_response(f"{source} heard: {text}")
+        self._wait_for_tts()
+
     def _check_response_delay_and_confirm(self, elapsed: float) -> bool:
         delayed, avg, count = self._response_is_delayed(elapsed)
         if not delayed:
@@ -905,16 +929,12 @@ class BuddyIntegratedPi:
         with self._stream_lock:
             jpeg_bytes = self._stream_frame
 
-        threading.Thread(
-            target=send_whatsapp_alert,
-            kwargs={
-                "label": "emergency",
-                "severity": "critical",
-                "reason": message,
-                "jpeg_bytes": jpeg_bytes,
-            },
-            daemon=True,
-        ).start()
+        self._send_alert_channels(
+            label="emergency",
+            severity="critical",
+            reason=message,
+            jpeg_bytes=jpeg_bytes,
+        )
 
         webhook_url = os.getenv("BUDDY_EMERGENCY_WEBHOOK_URL", "").strip()
         if webhook_url:
@@ -948,6 +968,41 @@ class BuddyIntegratedPi:
                 self.logger.warning("Emergency webhook returned status %s", response.status_code)
         except Exception as exc:
             self.logger.warning("Emergency webhook failed: %s", exc)
+
+    def _send_alert_channels(
+        self,
+        label: str,
+        severity: str,
+        reason: str,
+        jpeg_bytes: Optional[bytes] = None,
+    ):
+        message = (
+            f"Buddy alert: {label}\n"
+            f"Severity: {severity}\n"
+            f"Reason: {reason}\n"
+            "Please call or check immediately."
+        )
+
+        threading.Thread(
+            target=send_telegram_alert,
+            kwargs={
+                "label": label,
+                "severity": severity,
+                "reason": reason,
+                "jpeg_bytes": jpeg_bytes,
+            },
+            daemon=True,
+        ).start()
+
+        whatsapp_numbers = self._get_whatsapp_family_numbers()
+        if whatsapp_numbers:
+            threading.Thread(
+                target=self._send_whatsapp_family_alert,
+                args=(message, reason, whatsapp_numbers),
+                daemon=True,
+            ).start()
+        else:
+            print("[Alert] No BUDDY_FAMILY_WHATSAPP_NUMBERS configured.")
 
     def _get_whatsapp_family_numbers(self) -> list[str]:
         raw_numbers = os.getenv("BUDDY_FAMILY_WHATSAPP_NUMBERS", "").split(",")
@@ -1141,11 +1196,7 @@ class BuddyIntegratedPi:
         lowered = text.lower()
 
         # 0. Emergency
-        emergency_triggers = (
-            "emergency", "help me", "i need help", "call family",
-            "call emergency", "call someone",
-        )
-        if any(phrase in lowered for phrase in emergency_triggers):
+        if self._is_emergency_phrase(lowered):
             self._trigger_emergency_response(text)
             return
 
@@ -1597,11 +1648,12 @@ class BuddyIntegratedPi:
             }.get(label, f"Behavior alert: {label}")
             self.speak(msg)
 
-        threading.Thread(
-            target=send_whatsapp_alert,
-            kwargs={"label": label, "severity": severity, "reason": reason, "jpeg_bytes": jpeg_bytes},
-            daemon=True,
-        ).start()
+        self._send_alert_channels(
+            label=label,
+            severity=severity,
+            reason=reason,
+            jpeg_bytes=jpeg_bytes,
+        )
 
     def _on_obstacle(self):
         if not self.is_speaking:
@@ -1701,6 +1753,46 @@ class BuddyIntegratedPi:
             return
 
         self._send_follow_command("S")
+
+    def _update_servo_face_tracking(self, frame: np.ndarray):
+        if not self._servo_face_tracking_enabled:
+            return
+        if not self.servo_enabled or not self.servo or not self.last_faces:
+            return
+
+        now = time.time()
+        interval = float(os.getenv("BUDDY_SERVO_FACE_UPDATE_INTERVAL", self._SERVO_FACE_UPDATE_INTERVAL))
+        if now - self._servo_face_last_update < interval:
+            return
+
+        frame_h, _ = frame.shape[:2]
+        if frame_h <= 0:
+            return
+
+        x, y, w, h = max(self.last_faces, key=lambda box: box[2] * box[3])
+        face_center_y = y + (h / 2.0)
+        y_ratio = face_center_y / frame_h
+        error = y_ratio - 0.5
+
+        tolerance = float(os.getenv("BUDDY_SERVO_FACE_CENTER_TOLERANCE", self._SERVO_FACE_CENTER_TOLERANCE))
+        if abs(error) < tolerance:
+            return
+
+        gain = float(os.getenv("BUDDY_SERVO_FACE_GAIN", self._SERVO_FACE_GAIN))
+        min_angle = float(os.getenv("BUDDY_SERVO_FACE_MIN_ANGLE", self._SERVO_FACE_MIN_ANGLE))
+        max_angle = float(os.getenv("BUDDY_SERVO_FACE_MAX_ANGLE", self._SERVO_FACE_MAX_ANGLE))
+        try:
+            current_angle = float(self.servo.get_angle())
+        except Exception:
+            return
+
+        new_angle = current_angle - (error * gain)
+        new_angle = max(min_angle, min(max_angle, new_angle))
+        if abs(new_angle - current_angle) < 1.0:
+            return
+
+        self._servo_face_last_update = now
+        threading.Thread(target=self.servo.move_to, args=(new_angle, True), daemon=True).start()
 
     def _person_or_face_visible(self) -> bool:
         if self.last_faces:
@@ -1859,6 +1951,7 @@ class BuddyIntegratedPi:
             if self.frame_count % 10 == 0:
                 self._update_behavior_monitor(frame)
                 self._update_follow_mode(frame)
+                self._update_servo_face_tracking(frame)
 
             # pose-based behavior pipeline every 3rd frame
             if self.frame_count % 3 == 0:
@@ -1882,6 +1975,8 @@ class BuddyIntegratedPi:
         if not _vosk_available:
             return False
         rec = _KaldiRecognizer(_vosk_model, 16000)
+        wake_detected = False
+        emergency_text = ""
         proc = subprocess.Popen(
             ["arecord", "-D", self.arecord_device, "-f", "S16_LE", "-r", "16000", "-c", "1"],
             stdout=subprocess.PIPE,
@@ -1907,13 +2002,25 @@ class BuddyIntegratedPi:
                     text = json.loads(rec.PartialResult()).get("partial", "").lower()
                     if text:
                         print(f"[Vosk] Partial: '{text}'")
-                if text and any(w in text for w in self._WAKE_WORDS):
+                if not text:
+                    continue
+                if self._is_emergency_phrase(text):
+                    emergency_text = text
+                    print(f"[Vosk] Emergency phrase: '{text}'")
+                    break
+                if any(w in text for w in self._WAKE_WORDS):
+                    wake_detected = True
                     print(f"Wake word: '{text}'")
-                    return True
+                    break
         finally:
             proc.kill()
             proc.wait()
-        return False
+
+        if emergency_text:
+            self._handle_passive_emergency_phrase("Vosk", emergency_text)
+            return False
+
+        return wake_detected
 
     def _startup_greeting(self):
         time.sleep(1.0)
@@ -1929,7 +2036,11 @@ class BuddyIntegratedPi:
                 detected = self._vosk_listen_for_wake_word()
             else:
                 text = self.listen_for_speech()
-                detected = bool(text) and any(w in text.lower() for w in self._WAKE_WORDS)
+                lowered = text.lower() if text else ""
+                if lowered and self._is_emergency_phrase(lowered):
+                    self._handle_passive_emergency_phrase("STT", lowered)
+                    continue
+                detected = bool(lowered) and any(w in lowered for w in self._WAKE_WORDS)
 
             if not detected:
                 continue
@@ -1980,7 +2091,11 @@ class BuddyIntegratedPi:
                         break
                 else:
                     text = self.listen_for_speech()
-                    if text and any(w in text.lower() for w in self._WAKE_WORDS):
+                    lowered = text.lower() if text else ""
+                    if lowered and self._is_emergency_phrase(lowered):
+                        self._handle_passive_emergency_phrase("STT", lowered)
+                        continue
+                    if lowered and any(w in lowered for w in self._WAKE_WORDS):
                         self.sleep_mode = False
                         self._eye(EyeState.WAKING)
                         self.speak("I am awake. What can I do for you?")
@@ -1995,6 +2110,7 @@ class BuddyIntegratedPi:
 
     def run(self):
         self.running = True
+        print("[Safety] Passive camera and emergency-phrase detection enabled. Wake word is not required for alerts.")
         self._start_phone_listener()
         self._start_stream_server(port=8090)
         self._camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
