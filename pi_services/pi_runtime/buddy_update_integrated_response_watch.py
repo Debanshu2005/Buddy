@@ -1625,100 +1625,138 @@ class BuddyIntegratedPi:
         self._display_response(response)
 
     def _check_and_greet_face(self):
-        """Face scan first. If fails, fall back to password."""
-        from memory.pi_memory import find_name_by_password, get_all_names_with_passwords
+        """
+        1. Take a live photo.
+        2. Ask for password.
+        3. Find person by password.
+        4. Compare live photo with stored photo.
+        5. Greet if match, deny if not.
+        """
+        from memory.pi_memory import find_name_by_password, get_all_names_with_passwords, load_face_photo, compare_face_photos
 
-        # step 1: try face recognition
-        if self.local_vision_enabled and self.detector is not None and self.recognizer is not None:
-            print("[Face check] Reading frame...")
-            ok, frame = self._read_frame()
-            if not ok or frame is None:
-                frame = self.last_frame
-            if frame is not None:
-                print("[Face check] Detecting faces...")
-                faces = self.detector.detect(frame)
-                if faces:
-                    print(f"[Face check] {len(faces)} face(s) found, running recognition...")
-                    x, y, w, h = self.detector.get_largest_face(faces)
-                    face_roi = frame[y:y + h, x:x + w]
-                    name, confidence = self.recognizer.recognize(face_roi)
-                    print(f"[Face check] Result: {name} (confidence: {confidence:.2f})")
-                    if name != "Unknown" and confidence > 0.45:
-                        self.active_user = name
-                        print(f"[Face check] Match found: {name}")
-                        self.speak(f"Hi {name}! Good to see you.")
-                        self._wait_for_tts()
-                        return
-                    print(f"[Face check] No face match (confidence: {confidence:.2f}) — trying password")
-                else:
-                    print("[Face check] No faces found — trying password")
-            else:
-                print("[Face check] No frame — trying password")
-        else:
-            print("[Face check] Vision unavailable — trying password")
-
-        # step 2: password fallback
         registered = get_all_names_with_passwords()
         if not registered:
-            self.speak("I don't recognize you and no one is registered yet. Say register my face to get started.")
+            self.speak("No one is registered yet. Say register my face to get started.")
+            self._wait_for_tts()
             return
 
-        self.speak("I couldn't recognize your face. Please say your password.")
+        # step 1: capture live photo after 5s buffer
+        self.speak("I will take your photo in 5 seconds. Please look at the camera.")
+        self._wait_for_tts()
+        print("[Face check] Waiting 5 seconds before capturing...")
+        for i in range(5, 0, -1):
+            print(f"[Face check] {i}...")
+            time.sleep(1.0)
+        print("[Face check] Capturing live photo now...")
+        ok, frame = self._read_frame()
+        live_img = frame if ok and frame is not None else self.last_frame
+        if live_img is None:
+            self.speak("I can't see right now.")
+            self._wait_for_tts()
+            return
+
+        # crop to face if detector available
+        if self.detector is not None:
+            faces = self.detector.detect(live_img)
+            if faces:
+                x, y, w, h = self.detector.get_largest_face(faces)
+                padding = int(max(w, h) * 0.2)
+                x1 = max(0, x - padding)
+                y1 = max(0, y - padding)
+                x2 = min(live_img.shape[1], x + w + padding)
+                y2 = min(live_img.shape[0], y + h + padding)
+                live_img = live_img[y1:y2, x1:x2]
+                print(f"[Face check] Face cropped: {w}x{h}")
+            else:
+                print("[Face check] No face detected — using full frame")
+
+        # step 2: ask for password
+        self.speak("Please say your password.")
         self._wait_for_tts()
         time.sleep(0.1)
         print("[Password check] Listening for password...")
         self._play_listen_beep()
         password_text = self.listen_for_speech()
         if not password_text:
-            print("[Password check] No password heard")
-            self.speak("Sorry, I didn't catch that. I don't know you.")
+            self.speak("I didn't catch that. I don't know you.")
+            self._wait_for_tts()
             return
 
         password = password_text.lower().strip()
         print(f"[Password check] Heard: '{password}'")
-        found_name = find_name_by_password(password)
-        if found_name:
-            self.active_user = found_name
-            print(f"[Password check] Password matched: {found_name}")
-            self.speak(f"Hi {found_name}! Good to see you.")
+
+        # step 3: find name by password
+        name = find_name_by_password(password)
+        if not name:
+            print("[Password check] No match for password")
+            self.speak("Sorry, wrong password. I don't know you.")
             self._wait_for_tts()
+            return
+
+        print(f"[Password check] Password matched: {name}")
+
+        # step 4: compare photos
+        stored_img = load_face_photo(name)
+        if stored_img is None:
+            # no photo stored — password alone is enough
+            print(f"[Face check] No stored photo for {name} — accepting by password")
+            self.active_user = name
+            self.speak(f"Hi {name}! Good to see you.")
+            self._wait_for_tts()
+            return
+
+        match, score = compare_face_photos(live_img, stored_img)
+        print(f"[Face check] Photo similarity: {score:.2f} — {'MATCH' if match else 'NO MATCH'}")
+
+        if match:
+            self.active_user = name
+            self.speak(f"Hi {name}! Good to see you.")
         else:
-            print(f"[Password check] No match for: '{password}'")
-            self.speak("Sorry, I don't know you.")
-            self._wait_for_tts()
+            self.speak(f"The face doesn't match our records. Access denied.")
+        self._wait_for_tts()
 
     def _do_scan_then_save(self, name: str):
-        """Single front-facing scan then save. Simple and fast."""
-        print(f"[Registration] Scanning front face for {name}...")
+        """Take one photo of the face and save it. Simple and reliable."""
+        from memory.pi_memory import save_face_photo
+        print(f"[Registration] Looking for face to photograph for {name}...")
         captured = False
         for attempt in range(40):
             if self.last_frame is None:
                 time.sleep(0.1)
                 continue
-            faces = self.detector.detect(self.last_frame)
-            if not faces:
-                if attempt == 15:
-                    self.speak("Please look straight at the camera.")
+            ok, frame = self._read_frame()
+            frame = frame if ok and frame is not None else self.last_frame
+            if frame is None:
                 time.sleep(0.1)
                 continue
-            x, y, w, h = self.detector.get_largest_face(faces)
-            if w <= 80 or h <= 80:
-                time.sleep(0.1)
-                continue
-            face_roi = self.last_frame[y:y + h, x:x + w]
-            if self.recognizer.add_face(name, face_roi, "front"):
-                print(f"[Registration] ✅ Face captured for {name}")
+            if self.detector is not None:
+                faces = self.detector.detect(frame)
+                if not faces:
+                    if attempt == 15:
+                        self.speak("Please look straight at the camera.")
+                        self._wait_for_tts()
+                    time.sleep(0.1)
+                    continue
+                x, y, w, h = self.detector.get_largest_face(faces)
+                padding = int(max(w, h) * 0.2)
+                x1 = max(0, x - padding)
+                y1 = max(0, y - padding)
+                x2 = min(frame.shape[1], x + w + padding)
+                y2 = min(frame.shape[0], y + h + padding)
+                face_img = frame[y1:y2, x1:x2]
+            else:
+                # no detector — save full frame
+                face_img = frame
+            if save_face_photo(name, face_img):
+                print(f"[Registration] ✅ Photo saved for {name}")
                 captured = True
                 break
             time.sleep(0.1)
 
         if captured:
-            total = len(self.recognizer.known_faces.get(name, []))
-            print(f"[Registration] ✅ {name} saved with {total} embeddings")
-            self.speak(f"Done! I've saved your face {name}. I'll recognize you next time.")
+            self.speak(f"Done! I've saved your photo {name}. I'll recognize you next time.")
         else:
-            print(f"[Registration] ⚠️ Could not capture face for {name} — password saved")
-            self.speak(f"I couldn't scan your face clearly {name}, but your password is saved. You can use it to identify yourself.")
+            self.speak(f"Couldn't capture your photo {name}, but your password is saved.")
         self._wait_for_tts()
 
     def _is_stop_command(self, text: str) -> bool:

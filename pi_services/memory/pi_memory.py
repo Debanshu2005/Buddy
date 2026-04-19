@@ -19,6 +19,49 @@ except ImportError:
 
 _LOCAL_FACES_FILE = Path(__file__).resolve().parent / "faces_local.json"
 _LOCAL_PASSWORDS_FILE = Path(__file__).resolve().parent / "passwords_local.json"
+_PHOTOS_DIR = Path(__file__).resolve().parent / "face_photos"
+_PHOTOS_DIR.mkdir(exist_ok=True)
+
+
+def save_face_photo(name: str, image_bgr) -> bool:
+    """Save a BGR numpy face photo as JPEG for this person."""
+    import cv2
+    path = _PHOTOS_DIR / f"{name.lower()}.jpg"
+    ok = cv2.imwrite(str(path), image_bgr)
+    if ok:
+        print(f"\u2705 Face photo saved: {path}")
+    return ok
+
+
+def load_face_photo(name: str):
+    """Load stored face photo for name. Returns BGR numpy array or None."""
+    import cv2
+    path = _PHOTOS_DIR / f"{name.lower()}.jpg"
+    if not path.exists():
+        return None
+    return cv2.imread(str(path))
+
+
+def compare_face_photos(img_a, img_b, threshold: float = 0.4) -> tuple:
+    """
+    Compare two BGR face images using histogram correlation.
+    Returns (match: bool, score: float). Score 1.0 = identical, 0.0 = completely different.
+    threshold=0.4 means 40% similarity required — loose enough for lighting changes.
+    """
+    import cv2
+    import numpy as np
+    scores = []
+    for img in (img_a, img_b):
+        if img is None:
+            return False, 0.0
+    for i in range(3):  # B, G, R channels
+        h_a = cv2.calcHist([img_a], [i], None, [64], [0, 256])
+        h_b = cv2.calcHist([img_b], [i], None, [64], [0, 256])
+        cv2.normalize(h_a, h_a)
+        cv2.normalize(h_b, h_b)
+        scores.append(cv2.compareHist(h_a, h_b, cv2.HISTCMP_CORREL))
+    score = float(np.mean(scores))
+    return score >= threshold, round(score, 3)
 
 
 def _load_local() -> dict:
