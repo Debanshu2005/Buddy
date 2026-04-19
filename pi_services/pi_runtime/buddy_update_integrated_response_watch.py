@@ -355,6 +355,7 @@ class BuddyIntegratedPi:
         self._stream_frame: Optional[bytes] = None
         self._stream_lock = threading.Lock()
         self._pending_face_scan = False
+        self._text_mode_active = False
         self._pc_stream_active = False
         self._pc_stream_thread: Optional[threading.Thread] = None
         self._response_time_stats_path = ROOT_DIR / "memory" / "response_time_stats.json"
@@ -2940,9 +2941,12 @@ class BuddyIntegratedPi:
             lowered = line.strip().lower()
             if lowered in ("buddy", "hey buddy", "hi buddy"):
                 print("\n[Text Mode] Activated. Type your command (or 'exit' to return to voice mode):")
-                self._run_text_session()
+                self._text_mode_active = True
+                try:
+                    self._run_text_session()
+                finally:
+                    self._text_mode_active = False
             else:
-                # treat any other input as a direct command in text mode
                 print(f"[Text Mode] Tip: type 'buddy' first to enter text mode, or just speak.")
 
     def _run_text_session(self):
@@ -2965,7 +2969,11 @@ class BuddyIntegratedPi:
             # registration: ask for name/password via terminal
             lowered = text.lower()
             if any(p in lowered for p in ("register my face", "register face", "add my face", "save my face")):
-                self._text_register_face()
+                self._text_mode_active = True
+                try:
+                    self._text_register_face()
+                finally:
+                    self._text_mode_active = True  # keep active — still in text session
                 continue
 
             if any(p in lowered for p in (
@@ -3049,6 +3057,9 @@ class BuddyIntegratedPi:
     def _keyboard_loop(self):
         """Allow typed interaction from the terminal alongside voice input."""
         while self.running:
+            if self._text_mode_active:
+                time.sleep(0.1)
+                continue
             try:
                 text = input("\nYou> ").strip()
             except EOFError:
@@ -3060,6 +3071,8 @@ class BuddyIntegratedPi:
                 continue
 
             if not text:
+                continue
+            if self._text_mode_active:
                 continue
             print(f"[Typed] {text}")
             self._handle_typed_input(text)
