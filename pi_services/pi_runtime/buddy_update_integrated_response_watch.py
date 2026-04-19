@@ -2103,16 +2103,15 @@ class BuddyIntegratedPi:
     def _clap_detection_loop(self):
         """Background thread — listens for claps via RMS spike on the mic."""
         mic_rate = 48000
-        chunk_secs = 0.02          # 20ms chunks — short enough to catch a clap spike
+        chunk_secs = 0.02
         bytes_per_chunk = int(mic_rate * chunk_secs) * 2
 
-        # Clap signature: very high RMS spike that lasts < 3 chunks (~60ms)
-        CLAP_THRESHOLD   = float(os.getenv("BUDDY_CLAP_THRESHOLD",   "0.35"))  # RMS spike level
-        CLAP_MAX_CHUNKS  = int(os.getenv("BUDDY_CLAP_MAX_CHUNKS",    "3"))     # max chunks above threshold
-        CLAP_MIN_SILENCE = float(os.getenv("BUDDY_CLAP_MIN_SILENCE", "0.1"))   # silence before clap (s)
+        CLAP_THRESHOLD   = float(os.getenv("BUDDY_CLAP_THRESHOLD",   "0.15"))
+        CLAP_MAX_CHUNKS  = int(os.getenv("BUDDY_CLAP_MAX_CHUNKS",    "4"))
+        SILENCE_CHUNKS   = int(os.getenv("BUDDY_CLAP_SILENCE_CHUNKS", "5"))  # min silence before clap
 
         device = self._working_arecord_device or self.arecord_device
-        print(f"[Clap] Detection started on {device}")
+        print(f"[Clap] Detection started on {device} (threshold={CLAP_THRESHOLD})")
 
         while self.running and not self._cleaned_up:
             if self.sleep_mode or self.is_speaking or self.follow_mode:
@@ -2125,46 +2124,53 @@ class BuddyIntegratedPi:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                 )
-                silence_chunks = 0
-                spike_chunks   = 0
+
+                pre_silence  = 0   # chunks of silence before spike
+                spike_count  = 0   # chunks above threshold
+                in_spike     = False
 
                 while self.running and not self._cleaned_up:
                     if self.sleep_mode or self.is_speaking or self.follow_mode:
                         break
+
                     raw = proc.stdout.read(bytes_per_chunk)
                     if not raw or len(raw) < bytes_per_chunk:
                         break
+
                     chunk = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
                     rms   = float(np.sqrt(np.mean(chunk ** 2)))
 
-                    if rms < 0.01:          # silence
-                        silence_chunks += 1
-                        spike_chunks    = 0
-                    elif rms >= CLAP_THRESHOLD:
-                        if silence_chunks >= int(CLAP_MIN_SILENCE / chunk_secs):
-                            spike_chunks += 1
-                            if spike_chunks <= CLAP_MAX_CHUNKS:
-                                # still in spike — wait to see if it drops quickly
-                                pass
+                    if rms >= CLAP_THRESHOLD:
+                        if not in_spike:
+                            if pre_silence >= SILENCE_CHUNKS:
+                                # valid clap start
+                                in_spike    = True
+                                spike_count = 1
                             else:
-                                # too long — not a clap, reset
-                                spike_chunks   = 0
-                                silence_chunks = 0
+                                # not enough silence before — ignore
+                                pre_silence = 0
                         else:
-                            spike_chunks = 0
+                            spike_count += 1
+                            if spike_count > CLAP_MAX_CHUNKS:
+                                # too long — it's speech/noise, not a clap
+                                in_spike    = False
+                                spike_count = 0
+                                pre_silence = 0
                     else:
-                        if spike_chunks > 0:
-                            # spike ended quickly — it's a clap!
+                        if in_spike and spike_count <= CLAP_MAX_CHUNKS:
+                            # spike ended quickly — confirmed clap!
                             now = time.time()
                             if now - self._clap_last_time >= self._clap_cooldown:
                                 self._clap_last_time = now
-                                print(f"[Clap] Detected! RMS spike={rms:.3f}")
+                                print(f"[Clap] 👏 Detected! spike={spike_count} chunks, threshold={CLAP_THRESHOLD}")
                                 threading.Thread(
                                     target=self._on_clap_detected,
                                     daemon=True,
                                 ).start()
-                        spike_chunks   = 0
-                        silence_chunks = 0
+                        in_spike    = False
+                        spike_count = 0
+                        pre_silence = min(pre_silence + 1, SILENCE_CHUNKS + 10)
+
             except Exception as exc:
                 self.logger.debug("Clap detection error: %s", exc)
             finally:
@@ -2173,7 +2179,7 @@ class BuddyIntegratedPi:
                     proc.wait()
                 except Exception:
                     pass
-            time.sleep(0.5)  # brief pause before restarting arecord
+            time.sleep(0.5)
 
     def _detect_face_in_frame(self) -> Optional[tuple[float, float, float, float]]:
         """Return (x, y, w, h) of largest face in current frame, or None."""
