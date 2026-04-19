@@ -1741,7 +1741,7 @@ class BuddyIntegratedPi:
         avg_score = sum(scores) / len(scores)
         print(f"[Identity] Best: {best_score:.3f} | Avg: {avg_score:.3f}")
 
-        if best_score >= 0.35:
+        if best_score >= 0.30:
             self.active_user = name
             print(f"[Identity] ✅ Face matched: {name} (score={best_score:.3f})")
             self.speak(f"Hi {name}! Good to see you.")

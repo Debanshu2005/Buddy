@@ -101,7 +101,7 @@ class FaceRecognizer:
                         best_score = score
                         best_match = name
 
-            if best_score >= 0.45:
+            if best_score >= 0.35:
                 return best_match, best_score
             return "Unknown", 0.0
         except Exception as e:
@@ -128,10 +128,14 @@ class FaceRecognizer:
     def load_known_faces(self) -> None:
         try:
             faces = get_all_faces()
-            self.known_faces = {
-                name: [np.array(e, dtype=np.float32).flatten() for e in embeddings]
-                for name, embeddings in faces.items()
-            }
+            self.known_faces = {}
+            for name, embeddings in faces.items():
+                normalized = []
+                for e in embeddings:
+                    emb = np.array(e, dtype=np.float32).flatten()
+                    norm = np.linalg.norm(emb)
+                    normalized.append(emb / (norm + 1e-6))
+                self.known_faces[name] = normalized
             total = sum(len(v) for v in self.known_faces.values())
             print(f"✅ Loaded {len(self.known_faces)} people ({total} embeddings): {list(self.known_faces.keys())}")
         except Exception as e:

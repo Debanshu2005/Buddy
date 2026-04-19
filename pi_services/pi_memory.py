@@ -42,8 +42,8 @@ def save_face(name: str, embedding: np.ndarray, angle: str = "front") -> bool:
 
         cur.execute(
             "INSERT INTO faces (name, embedding) VALUES (%s, %s) "
-            "ON CONFLICT (name) DO UPDATE SET embedding = %s",
-            (key, embedding_json, embedding_json)
+            "ON CONFLICT (name) DO UPDATE SET embedding = EXCLUDED.embedding",
+            (key, embedding_json)
         )
         conn.commit()
         cur.close()

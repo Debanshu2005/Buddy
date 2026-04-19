@@ -241,8 +241,8 @@ def save_face(name: str, embedding: np.ndarray, angle: str = "front") -> bool:
         embedding_json = json.dumps(embedding_list)
         cur.execute(
             "INSERT INTO faces (name, embedding) VALUES (%s, %s) "
-            "ON CONFLICT (name) DO UPDATE SET embedding = %s",
-            (key, embedding_json, embedding_json)
+            "ON CONFLICT (name) DO UPDATE SET embedding = EXCLUDED.embedding",
+            (key, embedding_json)
         )
         conn.commit()
         cur.close()
@@ -267,10 +267,15 @@ def get_all_faces() -> Dict[str, List[np.ndarray]]:
         conn.close()
         for key, embedding in results:
             try:
+                # skip non-embedding entries (passwords, etc.)
+                if key.endswith("__password"):
+                    continue
                 if isinstance(embedding, str):
                     embedding = json.loads(embedding)
+                if not isinstance(embedding, list):
+                    continue
                 emb_array = np.array(embedding, dtype=np.float32).flatten()
-                if emb_array.size == 0:
+                if emb_array.size < 64:
                     continue
                 name = key.split("__")[0] if "__" in key else key
                 if name not in faces:
@@ -287,8 +292,12 @@ def get_all_faces() -> Dict[str, List[np.ndarray]]:
     local = _load_local()
     for key, embedding in local.items():
         try:
+            if key.endswith("__password"):
+                continue
+            if not isinstance(embedding, list):
+                continue
             emb_array = np.array(embedding, dtype=np.float32).flatten()
-            if emb_array.size == 0:
+            if emb_array.size < 64:
                 continue
             name = key.split("__")[0] if "__" in key else key
             if name not in faces:
