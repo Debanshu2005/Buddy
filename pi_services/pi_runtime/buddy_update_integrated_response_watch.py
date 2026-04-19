@@ -253,11 +253,11 @@ class BuddyIntegratedPi:
     _SERVO_FACE_MAX_ANGLE = 150.0
     _SERVO_FACE_UPDATE_INTERVAL = 0.12
     _EYE_TRACK_UPDATE_INTERVAL = 0.08
-    _BBOX_FALL_ASPECT_RATIO = 0.95
-    _BBOX_FALL_MIN_AREA_RATIO = 0.04
-    _BBOX_FALL_LOW_CENTER_RATIO = 0.48
-    _BBOX_FALL_CONFIRM_SECONDS = 1.2
-    _BBOX_FALL_ALERT_COOLDOWN_SECONDS = 90.0
+    _BBOX_FALL_ASPECT_RATIO = 1.12
+    _BBOX_FALL_MIN_AREA_RATIO = 0.055
+    _BBOX_FALL_LOW_CENTER_RATIO = 0.54
+    _BBOX_FALL_CONFIRM_SECONDS = 2.0
+    _BBOX_FALL_ALERT_COOLDOWN_SECONDS = 120.0
     _BLOOD_MIN_REGION_RATIO = 0.008
     _BLOOD_MIN_SATURATION = 105
     _BLOOD_MIN_VALUE = 35
@@ -398,7 +398,7 @@ class BuddyIntegratedPi:
                 config=PipelineConfig(
                     resize_width=224,
                     resize_height=224,
-                    process_every_n_frames=2,
+                    process_every_n_frames=3,
                     sequence_length=12,
                     enable_visualization=False,
                 ),
