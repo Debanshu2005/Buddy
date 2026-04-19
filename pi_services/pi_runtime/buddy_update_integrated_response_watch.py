@@ -188,7 +188,7 @@ class RuntimeSettings:
     pc_camera_port: int = 5000
     surveillance_enabled: bool = os.getenv("BUDDY_ENABLE_SURVEILLANCE", "0") == "1"
     surveillance_port: int = int(os.getenv("BUDDY_SURVEILLANCE_PORT", "8001"))
-    surveillance_cooldown: float = float(os.getenv("BUDDY_SURVEILLANCE_COOLDOWN", "120.0"))
+    surveillance_cooldown: float = float(os.getenv("BUDDY_SURVEILLANCE_COOLDOWN", "15.0"))
     ultrasonic_enabled: bool = os.getenv("BUDDY_ENABLE_ULTRASONIC", "0") == "1"
     ultrasonic_trigger_pin: int = int(os.getenv("BUDDY_ULTRASONIC_TRIGGER_PIN", "23"))
     ultrasonic_echo_pin: int = int(os.getenv("BUDDY_ULTRASONIC_ECHO_PIN", "24"))
@@ -1973,7 +1973,7 @@ class BuddyIntegratedPi:
             f"PC surveillance detected: {event_type} — {description} "
             f"(confidence {confidence:.0%})"
         )
-        print(f"[Surveillance] 🚨 {severity.upper()} received on Pi: {event_type} | {description} ({confidence:.0%})")
+        print(f"[Surveillance] {severity.upper()} received on Pi: {event_type} | {description} ({confidence:.0%})")
 
         jpeg_bytes: Optional[bytes] = None
         with self._stream_lock:
