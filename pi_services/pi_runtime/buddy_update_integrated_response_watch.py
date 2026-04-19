@@ -197,6 +197,23 @@ class RuntimeSettings:
 
 
 class BuddyIntegratedPi:
+    _IDENTITY_TRIGGERS = (
+        "do you know me",
+        "do u know me",
+        "who am i",
+        "do you recognize me",
+        "do u recognize me",
+        "recognize me",
+        "identify me",
+        "can you see me",
+        "do you remember me",
+        "do u remember me",
+        "remember me",
+        "have we met",
+        "do you know who i am",
+        "do u know who i am",
+        "who is this",
+    )
     _WAKE_WORDS = (
         "buddy",
         "hey buddy",
@@ -1537,6 +1554,10 @@ class BuddyIntegratedPi:
                     return clean.title()
         return ""
 
+    def _is_identity_check(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(phrase in lowered for phrase in self._IDENTITY_TRIGGERS)
+
     def _process_input(self, text: str):
         lowered = text.lower()
 
@@ -1629,13 +1650,7 @@ class BuddyIntegratedPi:
             return
 
         # 6. Identity check — single scan
-        identity_triggers = (
-            "do you know me", "who am i", "do you recognize me",
-            "recognize me", "identify me", "can you see me",
-            "do you remember me", "remember me", "have we met",
-            "do you know who i am", "who is this",
-        )
-        if any(p in lowered for p in identity_triggers):
+        if self._is_identity_check(lowered):
             self._check_and_greet_face()
             return
 
@@ -1653,6 +1668,12 @@ class BuddyIntegratedPi:
             self.speak("Face recognition is not available right now.")
             self._wait_for_tts()
             return
+
+        # Reload persisted faces first so recognition still works after a restart.
+        try:
+            self.recognizer.load_known_faces()
+        except Exception as exc:
+            self.logger.warning("Could not refresh known faces before identity check: %s", exc)
 
         if not self.recognizer.known_faces:
             self.speak("No one is registered yet. Say register my face to get started.")
@@ -2940,10 +2961,7 @@ class BuddyIntegratedPi:
                     self._text_mode_active = True  # keep active — still in text session
                 continue
 
-            if any(p in lowered for p in (
-                "do you know me", "who am i", "do you recognize me", "recognize me",
-                "do you remember me", "remember me", "have we met",
-            )):
+            if self._is_identity_check(lowered):
                 self._check_and_greet_face()
                 self._wait_for_tts()
                 continue
@@ -3091,9 +3109,7 @@ class BuddyIntegratedPi:
             if user_text:
                 _skip = any(p in user_text.lower() for p in (
                     "register my face", "register face", "add my face", "save my face",
-                    "do you know me", "who am i", "do you recognize me", "recognize me",
-                    "do you remember me", "remember me", "have we met",
-                ))
+                )) or self._is_identity_check(user_text)
                 if not _skip:
                     if not self._check_response_delay_and_confirm(response_elapsed):
                         self._wait_for_tts()
