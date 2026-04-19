@@ -497,6 +497,7 @@ class BuddyIntegratedPi:
     def _ultrasonic_loop(self):
         while self.running is False and not self._cleaned_up:
             time.sleep(0.05)
+        log_timer = 0.0
         while not self._cleaned_up:
             sensor = self._ultrasonic_sensor
             if sensor is None:
@@ -505,6 +506,10 @@ class BuddyIntegratedPi:
                 distance_m = float(sensor.distance) * float(self.settings.ultrasonic_max_distance_m)
                 self._ultrasonic_distance_m = distance_m
                 self._set_ultrasonic_blocked(distance_m <= self.settings.ultrasonic_stop_distance_m)
+                log_timer += self._ULTRASONIC_POLL_INTERVAL
+                if log_timer >= 2.0:
+                    log_timer = 0.0
+                    print(f"[Ultrasonic] distance={distance_m * 100:.1f} cm  blocked={self._ultrasonic_blocked}")
             except Exception as exc:
                 self.logger.debug("Ultrasonic read failed: %s", exc)
             time.sleep(self._ULTRASONIC_POLL_INTERVAL)
@@ -513,11 +518,14 @@ class BuddyIntegratedPi:
         if blocked == self._ultrasonic_blocked:
             return
         self._ultrasonic_blocked = blocked
+        dist_cm = int(self._ultrasonic_distance_m * 100) if self._ultrasonic_distance_m is not None else "?"
         if blocked:
+            print(f"[Ultrasonic] 🚧 BLOCKED — {dist_cm} cm")
             self._follow_last_command = "S"
             self.motors.stop()
             self._announce_proximity_stop(force=True)
         else:
+            print(f"[Ultrasonic] ✅ CLEAR — {dist_cm} cm")
             if not self.is_speaking:
                 self.speak("Path is clear.")
 
@@ -2091,10 +2099,26 @@ class BuddyIntegratedPi:
         frame_h, frame_w = frame.shape[:2]
         frame_area = float(max(1, frame_w * frame_h))
 
+        # try full vision stack first
         if self.last_faces:
             x, y, w, h = max(self.last_faces, key=lambda box: box[2] * box[3])
             return ((x + w / 2.0) / frame_w, (w * h) / frame_area, float(w * h))
 
+        # fallback: lightweight haar cascade directly (works without onnxruntime)
+        if not self.local_vision_enabled:
+            try:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                cascade = cv2.CascadeClassifier(
+                    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+                )
+                faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
+                if len(faces) > 0:
+                    x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
+                    return ((x + w / 2.0) / frame_w, (w * h) / frame_area, float(w * h))
+            except Exception:
+                pass
+
+        # fallback: person detection box
         person_boxes = []
         for det in self.current_detections:
             if not isinstance(det, dict) or det.get("name") != "person":
@@ -2123,10 +2147,7 @@ class BuddyIntegratedPi:
             return
         self._follow_last_command = cmd
         self._follow_last_command_time = now
-        if cmd == "S":
-            self.motors.stop()
-        else:
-            self.motors.move(cmd, duration)
+        self.motors.move_follow(cmd)
 
     def _update_follow_mode(self, frame: np.ndarray):
         if not self.follow_mode or self.sleep_mode or self._emergency_active:
@@ -2562,12 +2583,14 @@ class BuddyIntegratedPi:
             else:
                 processed = frame
 
+            if self.frame_count % 3 == 0:
+                self._update_follow_mode(frame)
+                self._update_eye_tracking(frame)
+
             if self.frame_count % 10 == 0:
                 self._update_behavior_monitor(frame)
                 self._update_bbox_fall_monitor(frame)
                 self._update_blood_monitor(frame)
-                self._update_follow_mode(frame)
-                self._update_eye_tracking(frame)
 
             # pose-based behavior pipeline every 3rd frame
             if self._behavior_pipeline is not None and self.frame_count % 3 == 0:
@@ -2881,6 +2904,7 @@ class BuddyIntegratedPi:
             self._surveillance_client.start()
         threading.Thread(target=self._startup_greeting, daemon=True).start()
         threading.Thread(target=self._text_mode_loop, daemon=True).start()
+        self._start_keyboard_listener()
         time.sleep(0.5)
         self._wake_loop()
 

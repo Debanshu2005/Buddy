@@ -130,6 +130,24 @@ class MotorController:
             self._duration_timer.daemon = True
             self._duration_timer.start()
 
+    def move_follow(self, cmd: str):
+        """
+        Send a single follow-mode command without touching the keepalive
+        or duration timer. Follow mode manages its own stop logic via
+        _update_follow_mode() which runs every camera frame.
+        """
+        if cmd == "S":
+            # stop() would cancel timers and reset keepalive — use it
+            self.stop()
+            return
+        if not self._ser or not self._ser.is_open:
+            return
+        # Only send if command changed — avoids flooding serial
+        if cmd != self._current_cmd:
+            self._current_cmd = cmd
+            self._send_raw(cmd)
+            print(f"🤖 Follow → {cmd!r}")
+
     def stop(self):
         """Stop all motors immediately. Cancels duration timer and keep-alive."""
         self._cancel_duration_timer()
@@ -206,17 +224,23 @@ class MotorController:
 
     def _start_keepalive(self):
         """
-        Re-send current movement command every 0.8s to guard against serial glitches.
-        Only sends movement commands (F/B/L/R) — never resends S, W, or N.
-        W and N are one-shot animations; S is explicit stop.
+        Re-send current movement command every 0.5s to guard against serial glitches.
+        Only resends F/B/L/R for continuous (non-follow) moves.
+        Follow mode uses move_follow() which manages its own cadence.
         """
         self._keepalive_active = True
         _MOVEMENT_CMDS = {"F", "B", "L", "R"}
 
         def _loop():
             while self._keepalive_active and self._running:
-                time.sleep(0.8)
-                if self._keepalive_active and self._current_cmd in _MOVEMENT_CMDS:
+                time.sleep(0.5)
+                # Only keepalive if no duration timer is pending
+                # (duration timer means it's a timed move, not continuous)
+                if (
+                    self._keepalive_active
+                    and self._current_cmd in _MOVEMENT_CMDS
+                    and (self._duration_timer is None or not self._duration_timer.is_alive())
+                ):
                     self._send_raw(self._current_cmd)
 
         self._keepalive_thread = threading.Thread(target=_loop, daemon=True)
