@@ -656,7 +656,8 @@ class BuddyIntegratedPi:
         self.recognizer = FaceRecognizer(self.config.model_path, self.config)
         self.object_detector = ObjectDetector(confidence_threshold=0.5)
         self.local_vision_enabled = True
-        self.logger.info("Local vision initialized successfully")
+        total = sum(len(v) for v in self.recognizer.known_faces.values())
+        self.logger.info("Local vision ready — %d people, %d embeddings loaded", len(self.recognizer.known_faces), total)
 
     def _init_camera(self):
         self.csi_frame_path = "/tmp/csi_frame.jpg"
@@ -1645,71 +1646,31 @@ class BuddyIntegratedPi:
         self._display_response(response)
 
     def _check_and_greet_face(self):
-        """
-        1. Ask for password to narrow down who to match against.
-        2. Give 5s buffer then capture live frames.
-        3. Match live embeddings against stored embeddings for that person.
-        4. Greet if similarity >= threshold, deny if not.
-        """
+        """Scan face directly against all stored embeddings. Fall back to password if no match."""
         from memory.pi_memory import find_name_by_password, get_all_names_with_passwords
 
-        registered = get_all_names_with_passwords()
-        if not registered:
+        if not self.local_vision_enabled or self.recognizer is None or self.detector is None:
+            self.speak("Face recognition is not available right now.")
+            self._wait_for_tts()
+            return
+
+        if not self.recognizer.known_faces:
             self.speak("No one is registered yet. Say register my face to get started.")
             self._wait_for_tts()
             return
 
-        # step 1: ask for password
-        self.speak("Please say your password.")
+        # step 1: scan face directly
+        self.speak("Let me scan your face. Please look at the camera.")
         self._wait_for_tts()
-        time.sleep(0.1)
-        print("[Identity] Listening for password...")
-        self._play_listen_beep()
-        password_text = self.listen_for_speech()
-        if not password_text:
-            self.speak("I didn't catch that. I don't know you.")
-            self._wait_for_tts()
-            return
+        print("[Face check] Scanning face...")
 
-        password = password_text.lower().strip()
-        print(f"[Identity] Password heard: '{password}'")
-        name = find_name_by_password(password)
-        if not name:
-            print("[Identity] No match for password")
-            self.speak("Sorry, wrong password. I don't know you.")
-            self._wait_for_tts()
-            return
-
-        print(f"[Identity] Password matched: {name}")
-
-        # step 2: check if we have stored embeddings for this person
-        if self.recognizer is None or name not in self.recognizer.known_faces or not self.recognizer.known_faces[name]:
-            # no face data — accept by password alone
-            print(f"[Identity] No stored face data for {name} — accepting by password")
-            self.active_user = name
-            self.speak(f"Hi {name}! Good to see you.")
-            self._wait_for_tts()
-            return
-
-        # step 3: 5s buffer then capture live frames
-        self.speak("I will scan your face in 5 seconds. Please look at the camera.")
-        self._wait_for_tts()
-        print("[Identity] Waiting 5 seconds...")
-        for i in range(5, 0, -1):
-            print(f"[Identity] {i}...")
-            time.sleep(1.0)
-
-        # step 4: capture 3 live frames and get best match score
-        print("[Identity] Scanning face now...")
-        scores = []
-        for attempt in range(20):
+        scores: dict[str, float] = {}
+        for attempt in range(25):
             ok, frame = self._read_frame()
             frame = frame if ok and frame is not None else self.last_frame
             if frame is None:
                 time.sleep(0.1)
                 continue
-            if self.detector is None:
-                break
             faces = self.detector.detect(frame)
             if not faces:
                 time.sleep(0.1)
@@ -1718,37 +1679,57 @@ class BuddyIntegratedPi:
             if w < 60 or h < 60:
                 time.sleep(0.1)
                 continue
-            face_roi = frame[y:y + h, x:x + w]
-            emb = self.recognizer.get_embedding(face_roi)
+            emb = self.recognizer.get_embedding(frame[y:y + h, x:x + w])
             if emb is None:
                 time.sleep(0.1)
                 continue
-            # compare against all stored embeddings for this person
-            person_scores = [float(np.dot(emb, stored)) for stored in self.recognizer.known_faces[name]]
-            scores.append(max(person_scores))
-            print(f"[Identity] Frame score: {scores[-1]:.3f}")
-            if len(scores) >= 3:
+            for name, stored_embs in self.recognizer.known_faces.items():
+                best = max((float(np.dot(emb, s)) for s in stored_embs), default=0.0)
+                scores[name] = max(scores.get(name, 0.0), best)
+            print(f"[Face check] Scores: { {n: f'{s:.3f}' for n, s in scores.items()} }")
+            time.sleep(0.15)
+            if attempt >= 4 and scores:
                 break
-            time.sleep(0.2)
 
-        if not scores:
-            print("[Identity] Could not capture live face")
-            self.speak(f"I couldn't see your face clearly. Accepting by password. Hi {name}!")
-            self.active_user = name
+        if scores:
+            best_name = max(scores, key=lambda n: scores[n])
+            best_score = scores[best_name]
+            print(f"[Face check] Best match: {best_name} ({best_score:.3f})")
+            if best_score >= 0.32:
+                self.active_user = best_name
+                self.speak(f"Yes, I know you! Hi {best_name}!")
+                self._wait_for_tts()
+                return
+
+        print("[Face check] No face match — trying password fallback")
+
+        # step 2: password fallback
+        registered = get_all_names_with_passwords()
+        if not registered:
+            self.speak("I couldn't recognize your face and no passwords are registered.")
             self._wait_for_tts()
             return
 
-        best_score = max(scores)
-        avg_score = sum(scores) / len(scores)
-        print(f"[Identity] Best: {best_score:.3f} | Avg: {avg_score:.3f}")
+        self.speak("I couldn't recognize your face. Please say your password.")
+        self._wait_for_tts()
+        time.sleep(0.1)
+        self._play_listen_beep()
+        self._eye(EyeState.LISTENING)
+        password_text = self.listen_for_speech()
+        self._eye(EyeState.IDLE)
+        if not password_text:
+            self.speak("I didn't catch that. I don't know you.")
+            self._wait_for_tts()
+            return
 
-        if best_score >= 0.30:
-            self.active_user = name
-            print(f"[Identity] ✅ Face matched: {name} (score={best_score:.3f})")
-            self.speak(f"Hi {name}! Good to see you.")
+        password = password_text.lower().strip()
+        print(f"[Password check] Heard: '{password}'")
+        found_name = find_name_by_password(password)
+        if found_name:
+            self.active_user = found_name
+            self.speak(f"Hi {found_name}! Good to see you.")
         else:
-            print(f"[Identity] ❌ Face did not match (score={best_score:.3f})")
-            self.speak("The face doesn't match our records. Access denied.")
+            self.speak("Sorry, I don't know you.")
         self._wait_for_tts()
 
     def _do_scan_then_save(self, name: str):
@@ -2923,25 +2904,8 @@ class BuddyIntegratedPi:
 
 
     def _text_mode_loop(self):
-        """Background thread: reads stdin. If user types 'buddy', enters text mode."""
-        import sys
-        while self.running:
-            try:
-                line = input()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if not line.strip():
-                continue
-            lowered = line.strip().lower()
-            if lowered in ("buddy", "hey buddy", "hi buddy"):
-                print("\n[Text Mode] Activated. Type your command (or 'exit' to return to voice mode):")
-                self._text_mode_active = True
-                try:
-                    self._run_text_session()
-                finally:
-                    self._text_mode_active = False
-            else:
-                print(f"[Text Mode] Tip: type 'buddy' first to enter text mode, or just speak.")
+        """Kept for compatibility — keyboard_loop now handles text mode activation."""
+        pass
 
     def _run_text_session(self):
         """Interactive text session — runs until user types 'exit' or 'voice mode'."""
@@ -3068,6 +3032,17 @@ class BuddyIntegratedPi:
                 continue
             if self._text_mode_active:
                 continue
+
+            lowered = text.lower().strip()
+            if lowered in ("buddy", "hey buddy", "hi buddy"):
+                print("\n[Text Mode] Activated. Type your command (or 'exit' to return to voice mode):")
+                self._text_mode_active = True
+                try:
+                    self._run_text_session()
+                finally:
+                    self._text_mode_active = False
+                continue
+
             print(f"[Typed] {text}")
             self._handle_typed_input(text)
 
