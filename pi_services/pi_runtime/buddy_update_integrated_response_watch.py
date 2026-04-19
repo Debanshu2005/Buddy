@@ -385,6 +385,10 @@ class BuddyIntegratedPi:
         self._ultrasonic_blocked = False
         self._ultrasonic_distance_m: Optional[float] = None
         self._ultrasonic_last_announce_time = 0.0
+        self._clap_thread: Optional[threading.Thread] = None
+        self._clap_last_time = 0.0
+        self._clap_cooldown = 3.0   # seconds between clap responses
+        self._clap_enabled = os.getenv("BUDDY_ENABLE_CLAP", "1") == "1"
 
         # Surveillance client — connects to PC surveillance server
         self._surveillance_client: Optional[_SurveillanceClient] = None
@@ -2114,6 +2118,179 @@ class BuddyIntegratedPi:
         if not self.is_speaking:
             self.speak("Path is clear.")
 
+    def _clap_detection_loop(self):
+        """Background thread — listens for claps via RMS spike on the mic."""
+        mic_rate = 48000
+        chunk_secs = 0.02          # 20ms chunks — short enough to catch a clap spike
+        bytes_per_chunk = int(mic_rate * chunk_secs) * 2
+
+        # Clap signature: very high RMS spike that lasts < 3 chunks (~60ms)
+        CLAP_THRESHOLD   = float(os.getenv("BUDDY_CLAP_THRESHOLD",   "0.35"))  # RMS spike level
+        CLAP_MAX_CHUNKS  = int(os.getenv("BUDDY_CLAP_MAX_CHUNKS",    "3"))     # max chunks above threshold
+        CLAP_MIN_SILENCE = float(os.getenv("BUDDY_CLAP_MIN_SILENCE", "0.1"))   # silence before clap (s)
+
+        device = self._working_arecord_device or self.arecord_device
+        print(f"[Clap] Detection started on {device}")
+
+        while self.running and not self._cleaned_up:
+            if self.sleep_mode or self.is_speaking or self.follow_mode:
+                time.sleep(0.2)
+                continue
+
+            try:
+                proc = subprocess.Popen(
+                    ["arecord", "-D", device, "-f", "S16_LE", "-r", str(mic_rate), "-c", "1"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                silence_chunks = 0
+                spike_chunks   = 0
+
+                while self.running and not self._cleaned_up:
+                    if self.sleep_mode or self.is_speaking or self.follow_mode:
+                        break
+                    raw = proc.stdout.read(bytes_per_chunk)
+                    if not raw or len(raw) < bytes_per_chunk:
+                        break
+                    chunk = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                    rms   = float(np.sqrt(np.mean(chunk ** 2)))
+
+                    if rms < 0.01:          # silence
+                        silence_chunks += 1
+                        spike_chunks    = 0
+                    elif rms >= CLAP_THRESHOLD:
+                        if silence_chunks >= int(CLAP_MIN_SILENCE / chunk_secs):
+                            spike_chunks += 1
+                            if spike_chunks <= CLAP_MAX_CHUNKS:
+                                # still in spike — wait to see if it drops quickly
+                                pass
+                            else:
+                                # too long — not a clap, reset
+                                spike_chunks   = 0
+                                silence_chunks = 0
+                        else:
+                            spike_chunks = 0
+                    else:
+                        if spike_chunks > 0:
+                            # spike ended quickly — it's a clap!
+                            now = time.time()
+                            if now - self._clap_last_time >= self._clap_cooldown:
+                                self._clap_last_time = now
+                                print(f"[Clap] Detected! RMS spike={rms:.3f}")
+                                threading.Thread(
+                                    target=self._on_clap_detected,
+                                    daemon=True,
+                                ).start()
+                        spike_chunks   = 0
+                        silence_chunks = 0
+            except Exception as exc:
+                self.logger.debug("Clap detection error: %s", exc)
+            finally:
+                try:
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass
+            time.sleep(0.5)  # brief pause before restarting arecord
+
+    def _detect_face_in_frame(self) -> Optional[tuple[float, float, float, float]]:
+        """Return (x, y, w, h) of largest face in current frame, or None."""
+        frame = self.last_frame
+        if frame is None:
+            ok, frame = self._read_frame()
+            if not ok or frame is None:
+                return None
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            )
+            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(50, 50))
+            if len(faces) > 0:
+                return tuple(max(faces, key=lambda b: b[2] * b[3]))
+        except Exception:
+            pass
+        return None
+
+    def _on_clap_detected(self):
+        """Rotate to find the person who clapped — left sweep then right sweep."""
+        if not self.motors.is_connected():
+            return
+        if self._ultrasonic_blocked or self._emergency_active:
+            return
+
+        print("[Clap] Scanning for face...")
+        self._eye(EyeState.CURIOUS)
+
+        # Step 1 — check if face already visible straight ahead
+        face = self._detect_face_in_frame()
+        if face is not None:
+            x, y, w, h = face
+            frame_w = self.last_frame.shape[1] if self.last_frame is not None else 640
+            center_x = (x + w / 2.0) / frame_w
+            print(f"[Clap] Face already visible at x={center_x:.2f} — centering")
+            self._center_on_face(center_x)
+            self._eye(EyeState.HAPPY)
+            return
+
+        # Step 2 — sweep left
+        print("[Clap] Sweeping left...")
+        found = self._clap_sweep("L", sweep_duration=1.2, check_interval=0.15)
+        if found:
+            self._eye(EyeState.HAPPY)
+            return
+
+        # Step 3 — sweep right (from center)
+        print("[Clap] Sweeping right...")
+        self.motors.move("R", 0.6)   # return roughly to center first
+        time.sleep(0.7)
+        found = self._clap_sweep("R", sweep_duration=1.2, check_interval=0.15)
+        if found:
+            self._eye(EyeState.HAPPY)
+            return
+
+        # Step 4 — return to center, give up
+        self.motors.move("L", 0.6)
+        time.sleep(0.7)
+        self.motors.stop()
+        print("[Clap] No face found after sweep")
+        self._eye(EyeState.IDLE)
+
+    def _clap_sweep(self, direction: str, sweep_duration: float, check_interval: float) -> bool:
+        """Rotate in direction, checking for face every check_interval seconds.
+        Stops and centers when face found. Returns True if face found."""
+        self.motors.move_follow(direction)
+        elapsed = 0.0
+        while elapsed < sweep_duration:
+            time.sleep(check_interval)
+            elapsed += check_interval
+            if self._ultrasonic_blocked:
+                self.motors.stop()
+                return False
+            face = self._detect_face_in_frame()
+            if face is not None:
+                self.motors.stop()
+                x, y, w, h = face
+                frame_w = self.last_frame.shape[1] if self.last_frame is not None else 640
+                center_x = (x + w / 2.0) / frame_w
+                print(f"[Clap] Face found during {direction} sweep at x={center_x:.2f}")
+                self._center_on_face(center_x)
+                return True
+        self.motors.stop()
+        return False
+
+    def _center_on_face(self, face_center_x: float):
+        """Fine-tune rotation to center the face horizontally."""
+        error = face_center_x - 0.5
+        tolerance = 0.12
+        if abs(error) < tolerance:
+            return
+        direction = "R" if error > 0 else "L"
+        nudge_time = min(0.4, abs(error) * 0.8)
+        self.motors.move_follow(direction)
+        time.sleep(nudge_time)
+        self.motors.stop()
+
     def _vosk_listen_for_stop(self):
         """Listen in background for stop command during continuous movement.
         Returns as soon as 'stop'/'halt'/'freeze' is heard or movement ends."""
@@ -2990,6 +3167,10 @@ class BuddyIntegratedPi:
         threading.Thread(target=self._startup_greeting, daemon=True).start()
         threading.Thread(target=self._text_mode_loop, daemon=True).start()
         self._start_keyboard_listener()
+        if self._clap_enabled:
+            self._clap_thread = threading.Thread(target=self._clap_detection_loop, daemon=True)
+            self._clap_thread.start()
+            print("[Clap] Detection enabled — clap to make Buddy find you")
         time.sleep(0.5)
         self._wake_loop()
 
