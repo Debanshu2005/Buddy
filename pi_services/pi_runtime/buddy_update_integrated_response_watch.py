@@ -214,12 +214,16 @@ class BuddyIntegratedPi:
         "back": "B",
         "left": "L",
         "right": "R",
+        "spin left": "L",
+        "spin right": "R",
+        "turn left": "L",
+        "turn right": "R",
     }
     _MOTOR_CONFIRMATIONS = {
         "F": "Moving forward.",
         "B": "Moving backward.",
-        "L": "Turning left.",
-        "R": "Turning right.",
+        "L": "Spinning left.",
+        "R": "Spinning right.",
         "S": "Stopped.",
     }
     _THINK_SOUNDS = (
@@ -1563,6 +1567,9 @@ class BuddyIntegratedPi:
                 return
             self.motors.move(cmd, duration)
             self.speak(self._MOTOR_CONFIRMATIONS.get(cmd, "On it."))
+            # if no duration — listen for stop in background via Vosk
+            if duration is None and cmd != "S":
+                threading.Thread(target=self._vosk_listen_for_stop, daemon=True).start()
             return
 
         # 4. Sleep
@@ -1808,7 +1815,8 @@ class BuddyIntegratedPi:
 
     def _parse_movement(self, text: str):
         cmd = None
-        for word, code in self._DIR_MAP.items():
+        # check longer phrases first so "spin left" matches before "left"
+        for word, code in sorted(self._DIR_MAP.items(), key=lambda x: -len(x[0])):
             if word in text:
                 cmd = code
                 break
@@ -2105,6 +2113,47 @@ class BuddyIntegratedPi:
     def _on_clear_path(self):
         if not self.is_speaking:
             self.speak("Path is clear.")
+
+    def _vosk_listen_for_stop(self):
+        """Listen in background for stop command during continuous movement.
+        Returns as soon as 'stop'/'halt'/'freeze' is heard or movement ends."""
+        if not _vosk_available:
+            return
+        rec = _KaldiRecognizer(_vosk_model, 16000)
+        proc = subprocess.Popen(
+            ["arecord", "-D", self.arecord_device, "-f", "S16_LE", "-r", "16000", "-c", "1"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        print("[Move] Listening for stop command...")
+        try:
+            while self.running:
+                # exit if movement was stopped externally (obstacle, etc.)
+                if self.motors._current_cmd == "S":
+                    break
+                raw = proc.stdout.read(8000)
+                if not raw:
+                    break
+                if self.is_speaking:
+                    rec.Reset()
+                    continue
+                if rec.AcceptWaveform(raw):
+                    text = json.loads(rec.Result()).get("text", "").lower()
+                else:
+                    text = json.loads(rec.PartialResult()).get("partial", "").lower()
+                if not text:
+                    continue
+                print(f"[Move] Heard: '{text}'")
+                if self._is_stop_command(text) or self._is_emergency_phrase(text):
+                    print("[Move] Stop command detected")
+                    self.motors.stop()
+                    self.speak("Stopped.")
+                    if self._is_emergency_phrase(text):
+                        self._trigger_emergency_response(text)
+                    break
+        finally:
+            proc.kill()
+            proc.wait()
 
     def _start_follow_mode(self):
         if not self.motors.is_connected():
