@@ -2597,6 +2597,102 @@ class BuddyIntegratedPi:
 
         return wake_detected
 
+
+    def _text_mode_loop(self):
+        """Background thread: reads stdin. If user types 'buddy', enters text mode."""
+        import sys
+        while self.running:
+            try:
+                line = input()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not line.strip():
+                continue
+            lowered = line.strip().lower()
+            if lowered in ("buddy", "hey buddy", "hi buddy"):
+                print("\n[Text Mode] Activated. Type your command (or 'exit' to return to voice mode):")
+                self._run_text_session()
+            else:
+                # treat any other input as a direct command in text mode
+                print(f"[Text Mode] Tip: type 'buddy' first to enter text mode, or just speak.")
+
+    def _run_text_session(self):
+        """Interactive text session — runs until user types 'exit' or 'voice mode'."""
+        import sys
+        while self.running:
+            try:
+                sys.stdout.write("[You] ")
+                sys.stdout.flush()
+                line = input()
+            except (EOFError, KeyboardInterrupt):
+                break
+            text = line.strip()
+            if not text:
+                continue
+            if text.lower() in ("exit", "quit", "voice mode", "back"):
+                print("[Text Mode] Returning to voice mode.")
+                break
+
+            # registration: ask for name/password via terminal
+            lowered = text.lower()
+            if any(p in lowered for p in ("register my face", "register face", "add my face", "save my face")):
+                self._text_register_face()
+                continue
+
+            if any(p in lowered for p in (
+                "do you know me", "who am i", "do you recognize me", "recognize me",
+                "do you remember me", "remember me", "have we met",
+            )):
+                self._check_and_greet_face()
+                self._wait_for_tts()
+                continue
+
+            # normal brain call
+            self._play_thinking_sound()
+            response = self._call_brain(text, self.active_user)
+            self._thinking_token = None
+            self._display_response(response)
+            self._wait_for_tts()
+
+    def _text_register_face(self):
+        """Full registration flow via terminal input."""
+        import sys
+
+        sys.stdout.write("[Registration] What is your name? ")
+        sys.stdout.flush()
+        try:
+            name_text = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        name = self._extract_name(name_text)
+        if not name:
+            words = [w.strip(".,!?") for w in name_text.split() if w.isalpha() and len(w) > 1]
+            name = words[0].title() if words else ""
+        if not name:
+            print("[Registration] Could not get name. Cancelled.")
+            return
+        print(f"[Registration] Name: {name}")
+
+        sys.stdout.write("[Registration] Set a password (any word or phrase): ")
+        sys.stdout.flush()
+        try:
+            password = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not password:
+            print("[Registration] No password entered. Cancelled.")
+            return
+        print(f"[Registration] Password set.")
+
+        from memory.pi_memory import save_password
+        save_password(name, password)
+        self.active_user = name
+
+        print(f"[Registration] Starting face scan for {name}. Look straight at the camera...")
+        self.speak(f"Starting face scan for {name}. Please look straight at the camera.")
+        self._wait_for_tts()
+        self._do_scan_then_save(name)
+
     def _startup_greeting(self):
         time.sleep(1.0)
         self.speak("Hey. I am Buddy. Call me anytime.")
@@ -2746,6 +2842,7 @@ class BuddyIntegratedPi:
         if self._surveillance_client is not None:
             self._surveillance_client.start()
         threading.Thread(target=self._startup_greeting, daemon=True).start()
+        threading.Thread(target=self._text_mode_loop, daemon=True).start()
         time.sleep(0.5)
         self._wake_loop()
 
