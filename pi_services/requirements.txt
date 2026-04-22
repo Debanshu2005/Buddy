@@ -1,53 +1,56 @@
 # ===============================
-# Core Computer Vision (Pi optimized)
+# Pi_Buddy — Raspberry Pi Requirements
+# Install with: pip install -r requirements.txt
 # ===============================
-opencv-python-headless>=4.8.0
+
+# ── Core ────────────────────────────────────────────────────────────────────
 numpy>=1.24.0
 scipy>=1.10.0
-mediapipe>=0.10.0
-
-# ===============================
-# Raspberry Pi Camera
-# ===============================
-picamera2
-
-# ===============================
-# Machine Learning (ONNX only - Python 3.13 compatible)
-# ===============================
-onnxruntime>=1.16.0
-scikit-learn>=1.4.0
-
-# ===============================
-# Face Recognition (InsightFace ArcFace + RetinaFace)
-# ===============================
-insightface>=0.7.3
-
-# ===============================
-# Object Detection (YOLOv8n ONNX export)
-# ===============================
-ultralytics>=8.0.0
-
-# ===============================
-# Database
-# ===============================
-psycopg2-binary>=2.9.0
+requests>=2.31.0
 python-dotenv>=1.0.0
 
-# ===============================
-# HTTP Requests
-# ===============================
-requests>=2.31.0
-fastapi>=0.110.0
-uvicorn>=0.29.0
+# ── Computer Vision ──────────────────────────────────────────────────────────
+# Use headless build on Pi (no GUI dependencies)
+opencv-python-headless>=4.8.0
+onnxruntime>=1.16.0
 
-# ===============================
-# Speech and TTS
-# ===============================
+# ── Machine Learning / Face Recognition ──────────────────────────────────────
+scikit-learn>=1.4.0
+insightface>=0.7.3
+
+# ── Object Detection ─────────────────────────────────────────────────────────
+# Only the ONNX inference part is used — no training dependencies needed
+ultralytics>=8.0.0
+
+# ── Speech & Audio ───────────────────────────────────────────────────────────
 edge-tts>=6.1.0
-pygame>=2.5.0
-websockets>=11.0
+websockets>=12.0
+vosk>=0.3.45
 
-# ===============================
-# Hardware control
-# ===============================
-RPi.GPIO>=0.7.1
+# ── Behavior / Pose Pipeline (optional — enable via BUDDY_ENABLE_MEDIAPIPE_BEHAVIOR=1) ──
+# Comment out if not using MediaPipe on Pi (heavy on older Pi models)
+mediapipe>=0.10.0
+
+# ── Hardware (Raspberry Pi only) ─────────────────────────────────────────────
+# RPi.GPIO and gpiozero are pre-installed on Raspberry Pi OS
+# Uncomment if installing on a fresh venv:
+# RPi.GPIO>=0.7.1
+# gpiozero>=2.0
+
+# ── Serial (Arduino motor controller) ────────────────────────────────────────
+pyserial>=3.5
+
+# ── OLED Display (SSD1306 / SH1106) ──────────────────────────────────────────
+luma.oled>=3.12.0
+
+# ── Camera (Pi Camera Module) ────────────────────────────────────────────────
+# picamera2 is installed via apt on Raspberry Pi OS, not pip:
+#   sudo apt install -y python3-picamera2
+# Uncomment only if using a pip-based environment:
+# picamera2
+
+# ── Notification / Phone Link ─────────────────────────────────────────────────
+# (uses only stdlib + requests — no extra deps)
+
+# ── Database (optional — only if psycopg2 is used) ───────────────────────────
+# psycopg2-binary>=2.9.0
