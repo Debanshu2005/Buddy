@@ -58,7 +58,7 @@ class Config:
     log_format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     
     # LLM Service Configuration
-    llm_service_url: str = "http://buddypc.local:8000"
+    llm_service_url: str = os.getenv("LLM_SERVICE_URL", "http://buddypc.local:8000")
 
     @classmethod
     def from_env(cls) -> 'Config':

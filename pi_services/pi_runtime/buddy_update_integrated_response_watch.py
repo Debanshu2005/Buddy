@@ -160,6 +160,17 @@ try:
 except ImportError:
     pass
 
+# Auto-discover the Buddy PC if no explicit IP is set
+try:
+    from core.pc_discovery import discover_pc_ip
+    _pc_ip = discover_pc_ip(verbose=True)
+    # Inject into env so RuntimeSettings and Config pick them up
+    os.environ.setdefault("BUDDY_STT_SERVER_IP", _pc_ip)
+    os.environ.setdefault("BUDDY_PC_CAMERA_IP", _pc_ip)
+    os.environ.setdefault("LLM_SERVICE_URL", f"http://{_pc_ip}:8000")
+except Exception as _disc_err:
+    print(f"[Discovery] Failed: {_disc_err}")
+
 _VOSK_MODEL_PATH = str(ROOT_DIR / "vosk-model-small-en-us-0.15")
 _vosk_model = None
 _vosk_available = False
@@ -265,6 +276,7 @@ class BuddyIntegratedPi:
     _VOICE_WEAK_MIN_SAMPLES = 10
     _VOICE_WEAK_RATIO = 0.35
     _VOICE_AVG_ALPHA = 0.15
+    _CONVERSATION_IDLE_TIMEOUT = 8.0
     _VISUAL_STILLNESS_SECONDS = 75.0
     _VISUAL_CHECK_COOLDOWN_SECONDS = 120.0
     _VISUAL_MOTION_THRESHOLD = 1.5
@@ -402,6 +414,7 @@ class BuddyIntegratedPi:
         self._follow_last_seen_time = 0.0
         self._eye_track_last_update = 0.0
         self._load_response_time_stats()
+        self._last_wake_text = ""
         self.servo = None
         self.servo_enabled = False
         self._servo_face_last_update = 0.0
@@ -467,6 +480,7 @@ class BuddyIntegratedPi:
         self._listen_loop: Optional[asyncio.AbstractEventLoop] = None
         self._working_arecord_device: Optional[str] = None
         self._listen_initial_timeout: Optional[float] = None
+        self._stt_endpoint_warned = False
 
         self._init_camera()
         self.stability = StabilityTracker(self.config)
@@ -489,6 +503,8 @@ class BuddyIntegratedPi:
         self._init_ultrasonic_sensor()
 
         self.tts_voice = "en-IN-NeerjaNeural"
+        self.tts_gain = max(0.5, float(os.getenv("BUDDY_TTS_GAIN", "2.0")))
+        self.listen_beep_gain = min(1.0, max(0.1, float(os.getenv("BUDDY_LISTEN_BEEP_GAIN", "0.75"))))
         self.speech_enabled = True
 
         self.eyes: Optional[OledEyes] = None
@@ -852,7 +868,7 @@ class BuddyIntegratedPi:
         frames = []
         for freq, dur in tones:
             t = np.linspace(0, dur, int(sample_rate * dur), endpoint=False)
-            tone = 0.3 * np.sin(2 * np.pi * freq * t)
+            tone = self.listen_beep_gain * np.sin(2 * np.pi * freq * t)
             frames.append((tone * 32767).astype(np.int16).tobytes())
 
         wav_path = tempfile.mktemp(suffix=".wav")
@@ -864,6 +880,7 @@ class BuddyIntegratedPi:
         return wav_path
 
     def _play_listen_beep(self):
+        wav_path = None
         try:
             wav_path = self._generate_beep_wav()
             for device in (self.aplay_device, "default"):
@@ -877,6 +894,12 @@ class BuddyIntegratedPi:
                     break
         except Exception as exc:
             self.logger.warning("Listen beep failed: %s", exc)
+        finally:
+            if wav_path:
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
 
     def _eye(self, state: EyeState):
         if self.eyes:
@@ -913,11 +936,23 @@ class BuddyIntegratedPi:
             return
 
         mp3_path = tempfile.mktemp(suffix=".mp3")
+        wav_path = tempfile.mktemp(suffix=".wav")
         with open(mp3_path, "wb") as handle:
             handle.write(audio_data)
         try:
             result = subprocess.run(
-                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", mp3_path],
+                [
+                    "ffplay",
+                    "-nodisp",
+                    "-autoexit",
+                    "-loglevel",
+                    "quiet",
+                    "-volume",
+                    "100",
+                    "-af",
+                    f"volume={self.tts_gain}",
+                    mp3_path,
+                ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=20,
@@ -925,19 +960,31 @@ class BuddyIntegratedPi:
             if result.returncode != 0:
                 raise Exception(f"ffplay returned {result.returncode}")
         except Exception as e:
-            print(f"[TTS] ffplay failed ({e}), trying aplay...")
+            print(f"[TTS] ffplay failed ({e}), trying ffmpeg/aplay...")
             try:
                 subprocess.run(
-                    ["aplay", "-D", self.aplay_device, mp3_path],
+                    ["ffmpeg", "-y", "-loglevel", "quiet", "-i", mp3_path, wav_path],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=20,
+                    check=True,
+                )
+                subprocess.run(
+                    ["aplay", "-D", self.aplay_device, "-q", wav_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=20,
+                    check=True,
                 )
             except Exception as e2:
-                print(f"[TTS] aplay also failed: {e2}")
+                print(f"[TTS] ffmpeg/aplay also failed: {e2}")
         finally:
             try:
                 os.remove(mp3_path)
+            except OSError:
+                pass
+            try:
+                os.remove(wav_path)
             except OSError:
                 pass
 
@@ -1047,22 +1094,38 @@ class BuddyIntegratedPi:
         max_samples = 16000 * 8
         if len(audio_16k) > max_samples:
             audio_16k = audio_16k[:max_samples]
-        uri = f"ws://{self.settings.stt_server_ip}:{self.settings.stt_port}"
+        stt_host = (self.settings.stt_server_ip or "").strip()
+        if stt_host in {"0.0.0.0", "::", "[::]"}:
+            stt_host = "127.0.0.1"
+            if not self._stt_endpoint_warned:
+                self._stt_endpoint_warned = True
+                self.logger.warning(
+                    "BUDDY_STT_SERVER_IP was set to a wildcard address; using %s for client connection.",
+                    stt_host,
+                )
+        uri = f"ws://{stt_host}:{self.settings.stt_port}"
+        print(f"[STT] Connecting to {uri} ({len(audio_16k)/16000:.1f}s audio)")
         try:
             async with websockets.connect(
                 uri,
-                ping_interval=None,   # disable keepalive pings — Whisper transcription takes time
-                open_timeout=5,
+                ping_interval=None,
+                open_timeout=10,
                 close_timeout=5,
             ) as websocket:
+                print("[STT] Connected — sending audio")
                 await websocket.send(audio_16k.tobytes())
+                print("[STT] Audio sent — waiting for transcription")
                 result = await asyncio.wait_for(websocket.recv(), timeout=30.0)
+                print(f"[STT] Received: '{result.strip()}'")
                 return result.strip() if result else ""
         except asyncio.TimeoutError:
-            self.logger.warning("STT timed out waiting for transcription")
+            self.logger.warning("[STT] Timed out waiting for transcription from %s", uri)
+            return ""
+        except OSError as exc:
+            self.logger.warning("[STT] Cannot reach server at %s — %s", uri, exc)
             return ""
         except Exception as exc:
-            self.logger.warning("STT websocket failed: %s", exc)
+            self.logger.warning("[STT] Websocket failed: %s", exc)
             return ""
 
     def _measure_voice_stats(self, audio: np.ndarray) -> dict[str, float]:
@@ -1270,6 +1333,60 @@ class BuddyIntegratedPi:
         common_variants = ("budy", "baddi", "buddhi")
         return any(token in common_variants for token in tokens)
 
+    def _extract_inline_command_from_wake(self, text: str) -> str:
+        """Keep command words if the user says wake phrase and request together."""
+        normalized = self._normalize_heard_text(text)
+        if not normalized:
+            return ""
+
+        wake_phrases = sorted(self._WAKE_WORDS, key=len, reverse=True)
+        for phrase in wake_phrases:
+            if normalized == phrase:
+                return ""
+            if normalized.startswith(f"{phrase} "):
+                return normalized[len(phrase):].strip()
+
+        tokens = normalized.split()
+        if not tokens:
+            return ""
+        if tokens[0] in {"buddy", "budy", "baddi", "buddhi"}:
+            return " ".join(tokens[1:]).strip()
+        return ""
+
+    def _handle_wake_interaction(self, inline_command: str = "") -> None:
+        print("Wake word detected")
+        self._run_conversation_session(initial_text=inline_command)
+
+    def _run_conversation_session(self, initial_text: str = "") -> None:
+        """Pure conversation mode — listen, respond, repeat until silence or sleep."""
+        idle_timeout = float(os.getenv("BUDDY_CONVERSATION_IDLE_TIMEOUT", self._CONVERSATION_IDLE_TIMEOUT))
+        pending_text = initial_text.strip()
+
+        while self.running and not self.sleep_mode:
+            if pending_text:
+                user_text = pending_text
+                pending_text = ""
+            else:
+                print("[Conversation] Listening...")
+                time.sleep(0.2)
+                self._play_listen_beep()
+                self._eye(EyeState.LISTENING)
+                user_text = self.listen_for_speech_with_initial_timeout(idle_timeout)
+                self._eye(EyeState.IDLE)
+                if not user_text:
+                    print("[Conversation] No follow-up heard. Returning to wake mode.")
+                    break
+
+            self._process_input(user_text)
+            self._wait_for_tts()
+            if self.sleep_mode:
+                break
+
+        with self._notif_lock:
+            pending = bool(self._notif_queue)
+        if pending:
+            threading.Thread(target=self._flush_notifications, daemon=True).start()
+
     def _handle_passive_emergency_phrase(self, source: str, text: str):
         self.follow_mode = False
         self.motors.stop()
@@ -1382,17 +1499,12 @@ class BuddyIntegratedPi:
             f"Reason: {reason}\n"
             "Please call or check immediately."
         )
-
-        threading.Thread(
-            target=send_telegram_alert,
-            kwargs={
-                "label": label,
-                "severity": severity,
-                "reason": reason,
-                "jpeg_bytes": jpeg_bytes,
-            },
-            daemon=True,
-        ).start()
+        self.logger.info(
+            "Telegram alerts temporarily disabled. Skipping alert send for %s (%s): %s",
+            label,
+            severity,
+            reason,
+        )
 
 
     def _get_whatsapp_family_numbers(self) -> list[str]:
@@ -1663,6 +1775,7 @@ class BuddyIntegratedPi:
                         current_objects, persistent_objects = self._get_objects_snapshot()
 
         objects = current_objects or list(persistent_objects)
+        print(f"[LLM] Sending: user='{recognized_user or self.active_user or 'unknown'}' text='{user_input}' objects={objects}")
         try:
             response = requests.post(
                 f"{self.config.llm_service_url}/chat",
@@ -1674,10 +1787,14 @@ class BuddyIntegratedPi:
                 timeout=90,
             )
             if response.status_code == 200:
-                return response.json()
+                payload = response.json()
+                print(f"[LLM] Reply received: intent={payload.get('intent', 'conversation')} emotion={payload.get('emotion', '')}")
+                return payload
             self.logger.warning("Brain returned status %s", response.status_code)
+            print(f"[LLM] Request failed with status {response.status_code}")
         except Exception as exc:
             self.logger.warning("Brain call failed: %s", exc)
+            print(f"[LLM] Error: {exc}")
         return {
             "reply": "Sorry, I'm having trouble thinking right now.",
             "intent": "conversation",
@@ -1756,17 +1873,14 @@ class BuddyIntegratedPi:
                 return
             self.motors.move(cmd, duration)
             self.speak(self._MOTOR_CONFIRMATIONS.get(cmd, "On it."))
-            # if no duration — listen for stop in background via Vosk
+            # if no duration — listen for stop in background via STT
             if duration is None and cmd != "S":
-                threading.Thread(target=self._vosk_listen_for_stop, daemon=True).start()
+                threading.Thread(target=self._listen_for_stop_command, daemon=True).start()
             return
 
         # 4. Sleep
         if any(phrase in lowered for phrase in self._SLEEP_PHRASES):
-            self.speak("Going to sleep. Say hey buddy to wake me up.")
-            self._wait_for_tts()
             self.sleep_mode = True
-            self._eye(EyeState.SLEEPING)
             return
 
         # 5. Register face
@@ -2439,46 +2553,29 @@ class BuddyIntegratedPi:
         time.sleep(nudge_time)
         self.motors.stop()
 
-    def _vosk_listen_for_stop(self):
-        """Listen in background for stop command during continuous movement.
-        Returns as soon as 'stop'/'halt'/'freeze' is heard or movement ends."""
-        if not _vosk_available:
-            return
-        rec = _KaldiRecognizer(_vosk_model, 16000)
-        proc = subprocess.Popen(
-            ["arecord", "-D", self.arecord_device, "-f", "S16_LE", "-r", "16000", "-c", "1"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        print("[Move] Listening for stop command...")
-        try:
-            while self.running:
-                # exit if movement was stopped externally (obstacle, etc.)
-                if self.motors._current_cmd == "S":
-                    break
-                raw = proc.stdout.read(8000)
-                if not raw:
-                    break
-                if self.is_speaking:
-                    rec.Reset()
-                    continue
-                if rec.AcceptWaveform(raw):
-                    text = json.loads(rec.Result()).get("text", "").lower()
-                else:
-                    text = json.loads(rec.PartialResult()).get("partial", "").lower()
-                if not text:
-                    continue
-                print(f"[Move] Heard: '{text}'")
-                if self._is_stop_command(text) or self._is_emergency_phrase(text):
-                    print("[Move] Stop command detected")
-                    self.motors.stop()
-                    self.speak("Stopped.")
-                    if self._is_emergency_phrase(text):
-                        self._trigger_emergency_response(text)
-                    break
-        finally:
-            proc.kill()
-            proc.wait()
+    def _listen_for_stop_command(self):
+        """Listen in background for stop/emergency during continuous movement using STT."""
+        print("[Move] Listening for stop command with STT...")
+        while self.running:
+            if self.motors._current_cmd == "S" or self.sleep_mode:
+                break
+            if self.is_speaking:
+                time.sleep(0.1)
+                continue
+
+            text = self.listen_for_speech_with_initial_timeout(1.5)
+            lowered = self._normalize_heard_text(text) if text else ""
+            if not lowered:
+                continue
+
+            print(f"[Move] Heard via STT: '{lowered}'")
+            if self._is_stop_command(lowered) or self._is_emergency_phrase(lowered):
+                print("[Move] Stop command detected")
+                self.motors.stop()
+                self.speak("Stopped.")
+                if self._is_emergency_phrase(lowered):
+                    self._trigger_emergency_response(lowered)
+                break
 
     def _start_follow_mode(self):
         if not self.motors.is_connected():
@@ -2698,7 +2795,7 @@ class BuddyIntegratedPi:
     def _update_bbox_fall_monitor(self, frame: np.ndarray):
         if os.getenv("BUDDY_ENABLE_BBOX_FALL_DETECTION", "1") == "0":
             return
-        if self.sleep_mode or self._emergency_active:
+        if self._emergency_active:
             return
 
         bbox = self._largest_person_bbox()
@@ -2765,7 +2862,7 @@ class BuddyIntegratedPi:
         """Detect blood-like red pooling as a low-confidence visual risk signal."""
         if os.getenv("BUDDY_ENABLE_BLOOD_HEURISTIC", "1") == "0":
             return
-        if self.sleep_mode or self._emergency_active:
+        if self._emergency_active:
             return
 
         roi = frame
@@ -2854,7 +2951,7 @@ class BuddyIntegratedPi:
     def _update_behavior_monitor(self, frame: np.ndarray):
         if os.getenv("BUDDY_ENABLE_VISUAL_SAFETY", "1") == "0":
             return
-        if self.sleep_mode or self._emergency_active:
+        if self._emergency_active:
             return
 
         try:
@@ -2980,9 +3077,6 @@ class BuddyIntegratedPi:
 
     def _camera_loop(self):
         while self.running:
-            if self.sleep_mode:
-                time.sleep(0.1)
-                continue
 
             ok, frame = self._read_frame()
             if not ok or frame is None:
@@ -3007,6 +3101,7 @@ class BuddyIntegratedPi:
         rec = _KaldiRecognizer(_vosk_model, 16000)
         wake_detected = False
         emergency_text = ""
+        self._last_wake_text = ""
         proc = subprocess.Popen(
             ["arecord", "-D", self.arecord_device, "-f", "S16_LE", "-r", "16000", "-c", "1"],
             stdout=subprocess.PIPE,
@@ -3037,6 +3132,7 @@ class BuddyIntegratedPi:
                     break
                 if self._heard_wake_word(normalized):
                     wake_detected = True
+                    self._last_wake_text = normalized
                     print(f"Wake word: '{text}'")
                     break
         finally:
@@ -3202,68 +3298,39 @@ class BuddyIntegratedPi:
             if self._pause_wake_listening:
                 time.sleep(0.1)
                 continue
-            if _vosk_available:
-                detected = self._vosk_listen_for_wake_word()
-            else:
-                text = self.listen_for_speech()
-                lowered = self._normalize_heard_text(text) if text else ""
-                if lowered and self._is_emergency_phrase(lowered):
-                    self._handle_passive_emergency_phrase("STT", lowered)
-                    continue
-                detected = self._heard_wake_word(lowered)
+            inline_command = ""
+            text = self.listen_for_speech()
+            lowered = self._normalize_heard_text(text) if text else ""
+            if lowered and self._is_emergency_phrase(lowered):
+                self._handle_passive_emergency_phrase("STT", lowered)
+                continue
+            detected = self._heard_wake_word(lowered)
+            inline_command = self._extract_inline_command_from_wake(lowered)
 
             if not detected:
                 continue
 
-            print("Wake word detected")
-            time.sleep(0.3)
-            self._play_listen_beep()
-            self._eye(EyeState.LISTENING)
-            listen_started = time.monotonic()
-            user_text = self.listen_for_speech()
-            response_elapsed = time.monotonic() - listen_started
-            voice_stats = dict(self._last_voice_stats)
-            self._eye(EyeState.IDLE)
-
-            # Only run wellness checks when we actually got speech
-            if user_text:
-                _skip = any(p in user_text.lower() for p in (
-                    "register my face", "register face", "add my face", "save my face",
-                )) or self._is_identity_check(user_text)
-                if not _skip:
-                    if not self._check_response_delay_and_confirm(response_elapsed):
-                        self._wait_for_tts()
-                        continue
-                    if not self._check_weak_voice_and_confirm(voice_stats):
-                        self._wait_for_tts()
-                        continue
-                self._record_response_time(response_elapsed)
-                self._record_voice_stats(voice_stats)
-                self._process_input(user_text)
-                self._wait_for_tts()
-
-            with self._notif_lock:
-                pending = bool(self._notif_queue)
-            if pending:
-                threading.Thread(target=self._flush_notifications, daemon=True).start()
+            self._handle_wake_interaction(inline_command)
             print("Waiting for 'Buddy'...")
 
         if self.sleep_mode and self.running:
             self._sleep_loop()
 
     def _sleep_loop(self):
-        print("Entering sleep mode...")
-        self.speak("Going to sleep. Say hey buddy to wake me up.")
+        print("Entering monitoring mode...")
+        self.speak("Going to sleep. I will keep watching. Say hey buddy to wake me up.")
         self._wait_for_tts()
+        self._eye(EyeState.SLEEPING)
+        self._last_motion_time = time.time()
 
         while self.running and self.sleep_mode:
             try:
                 if _vosk_available:
                     if self._vosk_listen_for_wake_word():
+                        inline_command = self._extract_inline_command_from_wake(self._last_wake_text)
                         self.sleep_mode = False
                         self._eye(EyeState.WAKING)
-                        self.speak("I am awake. What can I do for you?")
-                        self._wait_for_tts()
+                        self._handle_wake_interaction(inline_command)
                         break
                 else:
                     text = self.listen_for_speech()
@@ -3272,10 +3339,10 @@ class BuddyIntegratedPi:
                         self._handle_passive_emergency_phrase("STT", lowered)
                         continue
                     if self._heard_wake_word(lowered):
+                        inline_command = self._extract_inline_command_from_wake(lowered)
                         self.sleep_mode = False
                         self._eye(EyeState.WAKING)
-                        self.speak("I am awake. What can I do for you?")
-                        self._wait_for_tts()
+                        self._handle_wake_interaction(inline_command)
                         break
             except Exception as exc:
                 self.logger.warning("Sleep loop error: %s", exc)
