@@ -196,6 +196,16 @@ class RuntimeSettings:
     ultrasonic_max_distance_m: float = float(os.getenv("BUDDY_ULTRASONIC_MAX_DISTANCE_M", "2.0"))
 
 
+@dataclass
+class _CameraTask:
+    name: str
+    runner_name: str
+    interval_frames: int
+    latest_frame: Optional[np.ndarray] = None
+    latest_frame_count: int = 0
+    busy: bool = False
+
+
 class BuddyIntegratedPi:
     _IDENTITY_TRIGGERS = (
         "do you know me",
@@ -355,6 +365,8 @@ class BuddyIntegratedPi:
         self.current_detections = []
         self.last_faces = []
         self.persistent_objects: set[str] = set()
+        self._vision_state_lock = threading.Lock()
+        self._camera_task_lock = threading.Lock()
         self._last_logged_face_present: Optional[bool] = None
         self._last_logged_recognized_name: Optional[str] = None
         self._last_logged_objects: tuple[str, ...] = ()
@@ -407,6 +419,23 @@ class BuddyIntegratedPi:
         self._clap_last_time = 0.0
         self._clap_cooldown = 3.0   # seconds between clap responses
         self._clap_enabled = os.getenv("BUDDY_ENABLE_CLAP", "1") == "1"
+        self._camera_tasks: dict[str, _CameraTask] = {
+            "objects": _CameraTask(
+                name="objects",
+                runner_name="_run_object_detection_task",
+                interval_frames=max(1, self.settings.object_interval_frames),
+            ),
+            "faces": _CameraTask(
+                name="faces",
+                runner_name="_run_face_detection_task",
+                interval_frames=max(1, self.settings.face_interval_frames),
+            ),
+            "pose_behavior": _CameraTask(
+                name="pose_behavior",
+                runner_name="_run_pose_behavior_task",
+                interval_frames=3,
+            ),
+        }
 
         # Surveillance client — connects to PC surveillance server
         self._surveillance_client: Optional[_SurveillanceClient] = None
@@ -630,11 +659,11 @@ class BuddyIntegratedPi:
                     self.logger.warning("Follow face detection failed: %s", exc)
                     faces = []
                 if faces:
-                    self.last_faces = faces
+                    self._set_face_results(faces)
                     return True
             time.sleep(0.12)
 
-        self.last_faces = []
+        self._set_face_results([])
         return False
 
     def _probe_local_vision_stack(self) -> bool:
@@ -1469,6 +1498,138 @@ class BuddyIntegratedPi:
         except Exception as exc:
             self.logger.warning("Emergency call command failed: %s", exc)
 
+    def _get_faces_snapshot(self) -> list:
+        with self._vision_state_lock:
+            return list(self.last_faces)
+
+    def _get_detections_snapshot(self) -> list:
+        with self._vision_state_lock:
+            return list(self.current_detections)
+
+    def _get_objects_snapshot(self) -> tuple[list[str], set[str]]:
+        with self._vision_state_lock:
+            return list(self.current_objects), set(self.persistent_objects)
+
+    def _set_face_results(self, faces: list) -> None:
+        with self._vision_state_lock:
+            self.last_faces = list(faces)
+
+        if faces:
+            if self._last_logged_face_present is not True:
+                print("Detected face")
+                self._last_logged_face_present = True
+            largest = self.detector.get_largest_face(faces)
+            self.stability.update(largest)
+            return
+
+        if self._last_logged_face_present is not False:
+            self._last_logged_face_present = False
+        self.stability.reset()
+
+    def _set_object_results(self, detections: list[dict]) -> None:
+        current_objects = [det["name"] for det in detections if det["name"] != "person"]
+        with self._vision_state_lock:
+            self.current_detections = list(detections)
+            self.current_objects = current_objects
+            self.persistent_objects.update(current_objects)
+            current_objects_key = tuple(sorted(set(self.current_objects)))
+
+        if current_objects_key != self._last_logged_objects:
+            if current_objects_key:
+                print(f"Objects: {', '.join(current_objects_key)}")
+            self._last_logged_objects = current_objects_key
+
+    def _schedule_camera_tasks(self, frame: np.ndarray) -> None:
+        if self.local_vision_enabled:
+            self._submit_camera_task("objects", frame)
+            self._submit_camera_task("faces", frame)
+        if self._behavior_pipeline is not None:
+            self._submit_camera_task("pose_behavior", frame)
+
+    def _submit_camera_task(self, task_name: str, frame: np.ndarray) -> None:
+        task = self._camera_tasks.get(task_name)
+        if task is None or self.frame_count % task.interval_frames != 0:
+            return
+
+        should_start_worker = False
+        with self._camera_task_lock:
+            task.latest_frame = frame.copy()
+            task.latest_frame_count = self.frame_count
+            if not task.busy:
+                task.busy = True
+                should_start_worker = True
+
+        if should_start_worker:
+            threading.Thread(
+                target=self._camera_task_worker,
+                args=(task_name,),
+                daemon=True,
+                name=f"CameraTask-{task_name}",
+            ).start()
+
+    def _camera_task_worker(self, task_name: str) -> None:
+        while self.running and not self._cleaned_up:
+            with self._camera_task_lock:
+                task = self._camera_tasks.get(task_name)
+                if task is None:
+                    return
+                frame = task.latest_frame
+                frame_count = task.latest_frame_count
+                task.latest_frame = None
+
+            if frame is None:
+                with self._camera_task_lock:
+                    task = self._camera_tasks.get(task_name)
+                    if task is None:
+                        return
+                    if task.latest_frame is not None:
+                        continue
+                    if task is not None:
+                        task.busy = False
+                return
+
+            try:
+                runner = getattr(self, task.runner_name)
+                runner(frame, frame_count)
+            except Exception as exc:
+                self.logger.warning("%s worker failed: %s", task_name, exc)
+
+    def _run_object_detection_task(self, frame: np.ndarray, frame_count: int) -> None:
+        if not self.local_vision_enabled or self.object_detector is None:
+            return
+        detections = self.object_detector.detect(frame)
+        self._set_object_results(detections)
+
+    def _run_face_detection_task(self, frame: np.ndarray, frame_count: int) -> None:
+        if not self.local_vision_enabled or self.detector is None:
+            return
+        faces = self.detector.detect(frame)
+        self._set_face_results(faces)
+
+    def _run_pose_behavior_task(self, frame: np.ndarray, frame_count: int) -> None:
+        if self._behavior_pipeline is None:
+            return
+        result = self._behavior_pipeline.process_frame(frame)
+        if result.get("frame_processed") and result.get("person_detected"):
+            decision = result.get("decision", {})
+            if decision.get("label") not in ("normal", None):
+                print(
+                    f"[Behavior] {decision.get('label')} | "
+                    f"{decision.get('severity')} | {decision.get('reason')}"
+                )
+
+    def _run_camera_frame_tasks(self, frame: np.ndarray) -> None:
+        self._schedule_camera_tasks(frame)
+
+        if self.frame_count % 3 == 0:
+            self._update_follow_mode(frame)
+            self._update_eye_tracking(frame)
+
+        if self.frame_count % 10 == 0:
+            self._update_behavior_monitor(frame)
+            self._update_bbox_fall_monitor(frame)
+            self._update_blood_monitor(frame)
+
     def _force_face_recognition(self) -> Optional[str]:
         try:
             ok, frame = self._read_frame()
@@ -1489,18 +1650,19 @@ class BuddyIntegratedPi:
 
     def _call_brain(self, user_input: str, recognized_user: Optional[str] = None) -> dict:
         user_lower = user_input.lower()
+        current_objects, persistent_objects = self._get_objects_snapshot()
 
         if any(p in user_lower for p in ("what is", "what do you see", "in my hand", "holding")):
             # use already-detected objects from camera loop — no extra detection call
-            if not self.current_objects and self.local_vision_enabled and self.object_detector:
+            if not current_objects and self.local_vision_enabled and self.object_detector:
                 ok, frame = self._read_frame()
                 if ok and frame is not None:
                     fresh = self.object_detector.detect(frame)
                     if fresh:
-                        self.current_objects = [d["name"] for d in fresh if d["name"] != "person"]
-                        self.persistent_objects.update(self.current_objects)
+                        self._set_object_results(fresh)
+                        current_objects, persistent_objects = self._get_objects_snapshot()
 
-        objects = list(self.current_objects or self.persistent_objects)
+        objects = current_objects or list(persistent_objects)
         try:
             response = requests.post(
                 f"{self.config.llm_service_url}/chat",
@@ -1873,32 +2035,6 @@ class BuddyIntegratedPi:
         self.speak(reply)
 
     def _process_frame(self, frame: np.ndarray):
-        if not self.local_vision_enabled or self.detector is None or self.recognizer is None or self.object_detector is None:
-            return frame.copy()
-
-        if self.frame_count % self.settings.object_interval_frames == 0:
-            self.current_detections = self.object_detector.detect(frame)
-            self.current_objects = [det["name"] for det in self.current_detections if det["name"] != "person"]
-            self.persistent_objects.update(self.current_objects)
-            current_objects_key = tuple(sorted(set(self.current_objects)))
-            if current_objects_key != self._last_logged_objects:
-                if current_objects_key:
-                    print(f"Objects: {', '.join(current_objects_key)}")
-                self._last_logged_objects = current_objects_key
-
-        if self.frame_count % self.settings.face_interval_frames == 0:
-            self.last_faces = self.detector.detect(frame)
-            if self.last_faces:
-                if self._last_logged_face_present is not True:
-                    print("Detected face")
-                    self._last_logged_face_present = True
-                largest = self.detector.get_largest_face(self.last_faces)
-                self.stability.update(largest)
-            else:
-                if self._last_logged_face_present is not False:
-                    self._last_logged_face_present = False
-                self.stability.reset()
-
         return self._draw_visualization(frame.copy())
 
     def _draw_visualization(self, frame: np.ndarray) -> np.ndarray:
@@ -1907,10 +2043,13 @@ class BuddyIntegratedPi:
             cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
             return frame
 
-        if self.current_detections:
-            frame = self.object_detector.draw_detections(frame, self.current_detections)
+        current_detections = self._get_detections_snapshot()
+        last_faces = self._get_faces_snapshot()
 
-        for (x, y, w, h) in self.last_faces:
+        if current_detections:
+            frame = self.object_detector.draw_detections(frame, current_detections)
+
+        for (x, y, w, h) in last_faces:
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             if self.active_user:
                 cv2.putText(
@@ -2369,10 +2508,12 @@ class BuddyIntegratedPi:
     def _get_follow_target(self, frame: np.ndarray) -> Optional[tuple[float, float, float]]:
         frame_h, frame_w = frame.shape[:2]
         frame_area = float(max(1, frame_w * frame_h))
+        last_faces = self._get_faces_snapshot()
+        current_detections = self._get_detections_snapshot()
 
         # try full vision stack first
-        if self.last_faces:
-            x, y, w, h = max(self.last_faces, key=lambda box: box[2] * box[3])
+        if last_faces:
+            x, y, w, h = max(last_faces, key=lambda box: box[2] * box[3])
             return ((x + w / 2.0) / frame_w, (w * h) / frame_area, float(w * h))
 
         # fallback: lightweight haar cascade directly (works without onnxruntime)
@@ -2391,7 +2532,7 @@ class BuddyIntegratedPi:
 
         # fallback: person detection box
         person_boxes = []
-        for det in self.current_detections:
+        for det in current_detections:
             if not isinstance(det, dict) or det.get("name") != "person":
                 continue
             box = det.get("box") or det.get("bbox") or det.get("xyxy")
@@ -2462,7 +2603,8 @@ class BuddyIntegratedPi:
     def _update_servo_face_tracking(self, frame: np.ndarray):
         if not self._servo_face_tracking_enabled:
             return
-        if not self.servo_enabled or not self.servo or not self.last_faces:
+        last_faces = self._get_faces_snapshot()
+        if not self.servo_enabled or not self.servo or not last_faces:
             return
 
         now = time.time()
@@ -2474,7 +2616,7 @@ class BuddyIntegratedPi:
         if frame_h <= 0:
             return
 
-        x, y, w, h = max(self.last_faces, key=lambda box: box[2] * box[3])
+        x, y, w, h = max(last_faces, key=lambda box: box[2] * box[3])
         face_center_y = y + (h / 2.0)
         y_ratio = face_center_y / frame_h
         error = y_ratio - 0.5
@@ -2508,7 +2650,8 @@ class BuddyIntegratedPi:
         if now - self._eye_track_last_update < self._EYE_TRACK_UPDATE_INTERVAL:
             return
 
-        if not self.last_faces:
+        last_faces = self._get_faces_snapshot()
+        if not last_faces:
             self.eyes.center_gaze()
             self._eye_track_last_update = now
             return
@@ -2517,7 +2660,7 @@ class BuddyIntegratedPi:
         if frame_h <= 0 or frame_w <= 0:
             return
 
-        x, y, w, h = max(self.last_faces, key=lambda box: box[2] * box[3])
+        x, y, w, h = max(last_faces, key=lambda box: box[2] * box[3])
         error_x = ((x + (w / 2.0)) / frame_w) - 0.5
         error_y = ((y + (h / 2.0)) / frame_h) - 0.5
         gaze_dx = int(np.clip(error_x * 20.0, -8, 8))
@@ -2526,16 +2669,16 @@ class BuddyIntegratedPi:
         self._eye_track_last_update = now
 
     def _person_or_face_visible(self) -> bool:
-        if self.last_faces:
+        if self._get_faces_snapshot():
             return True
         return any(
             isinstance(det, dict) and det.get("name") == "person"
-            for det in self.current_detections
+            for det in self._get_detections_snapshot()
         )
 
     def _largest_person_bbox(self) -> Optional[tuple[float, float, float, float]]:
         person_boxes = []
-        for det in self.current_detections:
+        for det in self._get_detections_snapshot():
             if not isinstance(det, dict) or det.get("name") != "person":
                 continue
             box = det.get("bbox") or det.get("box") or det.get("xyxy")
@@ -2848,31 +2991,8 @@ class BuddyIntegratedPi:
 
             self.last_frame = frame.copy()
             self.frame_count += 1
-
-            if self.frame_count % 5 == 0:
-                processed = self._process_frame(frame)
-            else:
-                processed = frame
-
-            if self.frame_count % 3 == 0:
-                self._update_follow_mode(frame)
-                self._update_eye_tracking(frame)
-
-            if self.frame_count % 10 == 0:
-                self._update_behavior_monitor(frame)
-                self._update_bbox_fall_monitor(frame)
-                self._update_blood_monitor(frame)
-
-            # pose-based behavior pipeline every 3rd frame
-            if self._behavior_pipeline is not None and self.frame_count % 3 == 0:
-                try:
-                    result = self._behavior_pipeline.process_frame(frame)
-                    if result.get("frame_processed") and result.get("person_detected"):
-                        decision = result.get("decision", {})
-                        if decision.get("label") not in ("normal", None):
-                            print(f"[Behavior] {decision.get('label')} | {decision.get('severity')} | {decision.get('reason')}")
-                except Exception as exc:
-                    self.logger.warning("Behavior pipeline error: %s", exc)
+            self._run_camera_frame_tasks(frame)
+            processed = self._process_frame(frame) if self.frame_count % 5 == 0 else frame
 
             ok, buf = cv2.imencode(".jpg", processed, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
