@@ -27,9 +27,11 @@ edge-tts>=6.1.0
 websockets>=12.0
 vosk>=0.3.45
 
-# ── Behavior / Pose Pipeline (optional — enable via BUDDY_ENABLE_MEDIAPIPE_BEHAVIOR=1) ──
-# Comment out if not using MediaPipe on Pi (heavy on older Pi models)
-mediapipe>=0.10.0
+# ── Behavior / Pose Pipeline ────────────────────────────────────────────────
+# mediapipe has no Python 3.13 / ARM64 wheel — disabled by default
+# To enable: install Python 3.11, then: pip install mediapipe>=0.10.0
+# BUDDY_ENABLE_MEDIAPIPE_BEHAVIOR=0 (default) so this is not needed to run Buddy
+# mediapipe>=0.10.0
 
 # ── Hardware (Raspberry Pi only) ─────────────────────────────────────────────
 # RPi.GPIO and gpiozero are pre-installed on Raspberry Pi OS
