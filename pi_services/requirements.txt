@@ -19,8 +19,11 @@ scikit-learn>=1.4.0
 insightface>=0.7.3
 
 # ── Object Detection ─────────────────────────────────────────────────────────
-# Only the ONNX inference part is used — no training dependencies needed
-ultralytics>=8.0.0
+# ultralytics pulls in torch+CUDA which is huge — not needed on Pi.
+# The codebase uses YOLOv8 via ONNX directly through onnxruntime.
+# Only install these lightweight helpers:
+pillow>=10.0.0
+pyyaml>=6.0
 
 # ── Speech & Audio ───────────────────────────────────────────────────────────
 edge-tts>=6.1.0
