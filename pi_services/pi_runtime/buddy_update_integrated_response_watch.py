@@ -1354,38 +1354,34 @@ class BuddyIntegratedPi:
         return ""
 
     def _handle_wake_interaction(self, inline_command: str = "") -> None:
+        """Wake word detected — play beep, listen once via Whisper, process, return."""
         print("Wake word detected")
-        self._run_conversation_session(initial_text=inline_command)
+        self._pause_wake_listening = True
+        try:
+            if inline_command:
+                # wake phrase already contained a command — process it directly
+                self._process_input(inline_command)
+                self._wait_for_tts()
+                return
 
-    def _run_conversation_session(self, initial_text: str = "") -> None:
-        """Pure conversation mode — listen, respond, repeat until silence or sleep."""
-        idle_timeout = float(os.getenv("BUDDY_CONVERSATION_IDLE_TIMEOUT", self._CONVERSATION_IDLE_TIMEOUT))
-        pending_text = initial_text.strip()
+            time.sleep(0.2)
+            self._play_listen_beep()
+            self._eye(EyeState.LISTENING)
+            user_text = self.listen_for_speech()
+            self._eye(EyeState.IDLE)
 
-        while self.running and not self.sleep_mode:
-            if pending_text:
-                user_text = pending_text
-                pending_text = ""
-            else:
-                print("[Conversation] Listening...")
-                time.sleep(0.2)
-                self._play_listen_beep()
-                self._eye(EyeState.LISTENING)
-                user_text = self.listen_for_speech_with_initial_timeout(idle_timeout)
-                self._eye(EyeState.IDLE)
-                if not user_text:
-                    print("[Conversation] No follow-up heard. Returning to wake mode.")
-                    break
+            if not user_text:
+                return
 
             self._process_input(user_text)
             self._wait_for_tts()
-            if self.sleep_mode:
-                break
 
-        with self._notif_lock:
-            pending = bool(self._notif_queue)
-        if pending:
-            threading.Thread(target=self._flush_notifications, daemon=True).start()
+            with self._notif_lock:
+                pending = bool(self._notif_queue)
+            if pending:
+                threading.Thread(target=self._flush_notifications, daemon=True).start()
+        finally:
+            self._pause_wake_listening = False
 
     def _handle_passive_emergency_phrase(self, source: str, text: str):
         self.follow_mode = False
@@ -3145,6 +3141,69 @@ class BuddyIntegratedPi:
 
         return wake_detected
 
+    def _vosk_monitor_sleep(self) -> bool:
+        """
+        Continuous Vosk listener for sleep/monitoring mode.
+        - Stays running on a single arecord stream (no reconnect overhead).
+        - Triggers emergency response immediately for any emergency phrase.
+        - Returns True when wake word detected, False if stream ends.
+        """
+        if not _vosk_available:
+            return False
+
+        rec = _KaldiRecognizer(_vosk_model, 16000)
+        self._last_wake_text = ""
+        proc = subprocess.Popen(
+            ["arecord", "-D", self.arecord_device, "-f", "S16_LE", "-r", "16000", "-c", "1"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"[Monitor] Vosk monitoring on {self.arecord_device} — listening for emergencies and wake word...")
+
+        try:
+            while self.running and self.sleep_mode:
+                raw = proc.stdout.read(8000)
+                if not raw:
+                    print("[Monitor] arecord stream ended")
+                    break
+
+                if self.is_speaking:
+                    rec.Reset()
+                    continue
+
+                if rec.AcceptWaveform(raw):
+                    text = json.loads(rec.Result()).get("text", "").lower()
+                else:
+                    text = json.loads(rec.PartialResult()).get("partial", "").lower()
+
+                if not text:
+                    continue
+
+                normalized = self._normalize_heard_text(text)
+
+                # Emergency — handle immediately, stay in monitoring mode
+                if self._is_emergency_phrase(normalized):
+                    print(f"[Monitor] 🚨 Emergency phrase: '{text}'")
+                    threading.Thread(
+                        target=self._handle_passive_emergency_phrase,
+                        args=("Vosk", text),
+                        daemon=True,
+                    ).start()
+                    rec.Reset()
+                    continue
+
+                # Wake word — exit monitoring mode
+                if self._heard_wake_word(normalized):
+                    self._last_wake_text = normalized
+                    print(f"[Monitor] Wake word: '{text}'")
+                    return True
+
+        finally:
+            proc.kill()
+            proc.wait()
+
+        return False
+
 
     def _text_mode_loop(self):
         """Kept for compatibility — keyboard_loop now handles text mode activation."""
@@ -3298,17 +3357,20 @@ class BuddyIntegratedPi:
             if self._pause_wake_listening:
                 time.sleep(0.1)
                 continue
-            inline_command = ""
-            text = self.listen_for_speech()
-            lowered = self._normalize_heard_text(text) if text else ""
-            if lowered and self._is_emergency_phrase(lowered):
-                self._handle_passive_emergency_phrase("STT", lowered)
-                continue
-            detected = self._heard_wake_word(lowered)
-            inline_command = self._extract_inline_command_from_wake(lowered)
-
-            if not detected:
-                continue
+            if _vosk_available:
+                detected = self._vosk_listen_for_wake_word()
+                if not detected:
+                    continue
+                inline_command = self._extract_inline_command_from_wake(self._last_wake_text)
+            else:
+                text = self.listen_for_speech()
+                lowered = self._normalize_heard_text(text) if text else ""
+                if lowered and self._is_emergency_phrase(lowered):
+                    self._handle_passive_emergency_phrase("STT", lowered)
+                    continue
+                if not self._heard_wake_word(lowered):
+                    continue
+                inline_command = self._extract_inline_command_from_wake(lowered)
 
             self._handle_wake_interaction(inline_command)
             print("Waiting for 'Buddy'...")
@@ -3326,13 +3388,17 @@ class BuddyIntegratedPi:
         while self.running and self.sleep_mode:
             try:
                 if _vosk_available:
-                    if self._vosk_listen_for_wake_word():
+                    # Single continuous stream — handles emergencies inline, returns on wake word
+                    if self._vosk_monitor_sleep():
                         inline_command = self._extract_inline_command_from_wake(self._last_wake_text)
                         self.sleep_mode = False
                         self._eye(EyeState.WAKING)
+                        self.speak("I am awake. What can I do for you?")
+                        self._wait_for_tts()
                         self._handle_wake_interaction(inline_command)
                         break
                 else:
+                    # No Vosk — use Whisper only for emergency phrases in sleep
                     text = self.listen_for_speech()
                     lowered = self._normalize_heard_text(text) if text else ""
                     if lowered and self._is_emergency_phrase(lowered):
@@ -3342,6 +3408,8 @@ class BuddyIntegratedPi:
                         inline_command = self._extract_inline_command_from_wake(lowered)
                         self.sleep_mode = False
                         self._eye(EyeState.WAKING)
+                        self.speak("I am awake. What can I do for you?")
+                        self._wait_for_tts()
                         self._handle_wake_interaction(inline_command)
                         break
             except Exception as exc:
