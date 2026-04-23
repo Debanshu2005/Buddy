@@ -6,6 +6,7 @@ Requires: luma.oled  (pip install luma.oled)
 """
 import threading
 import time
+import logging
 from dataclasses import dataclass
 from enum import Enum
 
@@ -123,6 +124,8 @@ class OledEye:
         blink_lid      = 0.0
         bob = 0
         bob_dir = 1
+        _i2c_errors = 0
+        _MAX_I2C_ERRORS = 5
 
         while not self._stop.is_set():
             with self._lock:
@@ -136,7 +139,16 @@ class OledEye:
                 eye.lid = 0.95
                 eye.brow_y = -6
                 eye.brow_tilt = 4   # droopy
-                _render(self._device, eye)
+                try:
+                    _render(self._device, eye)
+                    _i2c_errors = 0
+                except OSError as exc:
+                    _i2c_errors += 1
+                    logging.debug("[OLED] I2C error (%d/%d): %s", _i2c_errors, _MAX_I2C_ERRORS, exc)
+                    if _i2c_errors >= _MAX_I2C_ERRORS:
+                        logging.warning("[OLED] Too many I2C errors — stopping eye loop")
+                        return
+                    time.sleep(0.5)
                 time.sleep(0.1)
                 continue
 
@@ -144,7 +156,16 @@ class OledEye:
                 for lid in [0.9, 0.7, 0.5, 0.3, 0.1, 0.0]:
                     eye.lid = lid
                     eye.brow_y = -6 + int((1 - lid) * 4)
-                    _render(self._device, eye)
+                    try:
+                        _render(self._device, eye)
+                        _i2c_errors = 0
+                    except OSError as exc:
+                        _i2c_errors += 1
+                        logging.debug("[OLED] I2C error (%d/%d): %s", _i2c_errors, _MAX_I2C_ERRORS, exc)
+                        if _i2c_errors >= _MAX_I2C_ERRORS:
+                            logging.warning("[OLED] Too many I2C errors — stopping eye loop")
+                            return
+                        break
                     time.sleep(0.07)
                 with self._lock:
                     if self._state == EyeState.WAKING:
@@ -152,19 +173,27 @@ class OledEye:
                 continue
 
             if state == EyeState.THINKING:
-                # squished eye + pupil sweeps left-right + furrowed brow
                 eye.h = 10
                 eye.brow_y   = -6
-                eye.brow_tilt = 6   # inner end down = furrowed/V shape
+                eye.brow_tilt = 6
                 sweep = int(12 * (time.time() % 1.0 - 0.5) * 2)
                 eye.pupil_dx = max(-10, min(10, sweep))
-                _render(self._device, eye)
+                try:
+                    _render(self._device, eye)
+                    _i2c_errors = 0
+                except OSError as exc:
+                    _i2c_errors += 1
+                    logging.debug("[OLED] I2C error (%d/%d): %s", _i2c_errors, _MAX_I2C_ERRORS, exc)
+                    if _i2c_errors >= _MAX_I2C_ERRORS:
+                        logging.warning("[OLED] Too many I2C errors — stopping eye loop")
+                        return
+                    time.sleep(0.5)
                 time.sleep(0.05)
                 continue
 
             if state == EyeState.LISTENING:
                 eye.w, eye.h = 33, 27
-                eye.brow_y   = -10  # raised brow
+                eye.brow_y   = -10
 
             if state == EyeState.HAPPY:
                 eye.lid = 0.35
@@ -173,15 +202,13 @@ class OledEye:
                 eye.brow_tilt = -3
 
             if state == EyeState.PROUD:
-                # half-closed confident look, brow raised on outer end
                 eye.lid       = 0.25
                 eye.cy       -= 3
                 eye.brow_y    = -13
-                eye.brow_tilt = -5   # strong arch
-                eye.pupil_dy  = -4   # looking slightly up
+                eye.brow_tilt = -5
+                eye.pupil_dy  = -4
 
             if state == EyeState.EXCITED:
-                # wide open, bouncing
                 eye.w, eye.h  = 34, 28
                 eye.brow_y    = -13
                 eye.brow_tilt = -4
@@ -194,24 +221,23 @@ class OledEye:
                 eye.lid       = 0.2
                 eye.cy       += 3
                 eye.brow_y    = -5
-                eye.brow_tilt = 5    # droopy inner = sad V
-                eye.pupil_dy  = 5    # looking down
+                eye.brow_tilt = 5
+                eye.pupil_dy  = 5
 
             if state == EyeState.ANGRY:
                 eye.brow_y    = -5
-                eye.brow_tilt = 8    # heavy furrowed V
+                eye.brow_tilt = 8
                 eye.pupil_dy  = 3
 
             if state == EyeState.CURIOUS:
                 eye.w, eye.h  = 32, 26
                 eye.brow_y    = -11
                 eye.brow_tilt = -2
-                # pupil drifts right — looking sideways
                 eye.pupil_dx  = 7
 
             if state == EyeState.SURPRISED:
                 eye.w, eye.h  = 36, 30
-                eye.brow_y    = -14  # very high
+                eye.brow_y    = -14
                 eye.brow_tilt = -4
 
             if state == EyeState.SPEAKING:
@@ -237,7 +263,16 @@ class OledEye:
                 if blink_lid >= 1.0:
                     blinking = False
 
-            _render(self._device, eye)
+            try:
+                _render(self._device, eye)
+                _i2c_errors = 0
+            except OSError as exc:
+                _i2c_errors += 1
+                logging.debug("[OLED] I2C error (%d/%d): %s", _i2c_errors, _MAX_I2C_ERRORS, exc)
+                if _i2c_errors >= _MAX_I2C_ERRORS:
+                    logging.warning("[OLED] Too many I2C errors — stopping eye loop")
+                    return
+                time.sleep(0.5)
             time.sleep(0.05)
 
 
