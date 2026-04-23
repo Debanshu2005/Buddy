@@ -341,7 +341,7 @@ class BuddyIntegratedPi(
         self._clap_thread: Optional[threading.Thread] = None
         self._clap_last_time = 0.0
         self._clap_cooldown = 3.0
-        self._clap_enabled = os.getenv("BUDDY_ENABLE_CLAP", "1") == "1"
+        self._clap_enabled = False
         self._listen_loop: Optional[asyncio.AbstractEventLoop] = None
         self._working_arecord_device: Optional[str] = None
         self._listen_initial_timeout: Optional[float] = None
