@@ -302,6 +302,7 @@ class CameraMixin:
         if self.frame_count % 3 == 0:
             self._update_follow_mode(frame)
             self._update_eye_tracking(frame)
+            self._update_servo_face_tracking(frame)
 
         if self.frame_count % 10 == 0:
             self._update_behavior_monitor(frame)

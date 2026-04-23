@@ -12,6 +12,24 @@ except Exception:
     DistanceSensor = None
 
 class FollowMixin:
+    def _init_servo(self):
+        if not self.settings.use_servo or os.getenv("BUDDY_ENABLE_SERVO", "1") == "0":
+            self.logger.info("Servo disabled by settings")
+            return
+        try:
+            from hardware.servo_controller import ServoController
+            self.servo = ServoController(move_on_start=False)
+            self.servo_enabled = bool(getattr(self.servo, "_pwm", None))
+            if self.servo_enabled:
+                self._servo_face_tracking_enabled = True
+                self.logger.info("Servo initialized — face tracking enabled")
+            else:
+                self.logger.warning("Servo controller loaded but PWM is unavailable")
+        except Exception as exc:
+            self.servo = None
+            self.servo_enabled = False
+            self.logger.warning("Servo unavailable: %s", exc)
+
     def _init_ultrasonic_sensor(self):
         if not self.settings.ultrasonic_enabled:
             self.logger.info("Ultrasonic stop sensor disabled")
