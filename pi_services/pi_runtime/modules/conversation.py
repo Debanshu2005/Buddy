@@ -7,7 +7,7 @@ from hardware.oled_eyes import EyeState
 
 def _get_vosk_available() -> bool:
     """Read vosk availability from buddy module at call time (loaded once there)."""
-    if os.getenv("BUDDY_DISABLE_VOSK_WAKE", "0") == "1":
+    if os.getenv("BUDDY_DISABLE_VOSK_WAKE", "1") != "0":
         return False
     try:
         import pi_runtime.buddy as _buddy

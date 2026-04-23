@@ -11,7 +11,7 @@ except Exception:
 
 def _get_vosk_globals():
     """Fetch vosk state from buddy module at call time (loaded once there)."""
-    if os.getenv("BUDDY_DISABLE_VOSK_WAKE", "0") == "1":
+    if os.getenv("BUDDY_DISABLE_VOSK_WAKE", "1") != "0":
         return False, None
     try:
         import pi_runtime.buddy as _buddy
