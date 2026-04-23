@@ -8,6 +8,7 @@ Run from pi_services/:
 from __future__ import annotations
 
 import atexit
+import asyncio
 import logging
 import os
 import signal
@@ -68,7 +69,6 @@ from hardware.motor_controller import MotorController
 from hardware.oled_eyes import OledEyes, EyeState
 from phone_link.core import process_notification
 from vision.behavior.pipeline import BehaviorDetectionPipeline, PipelineConfig
-from vision.behavior.whatsapp_alert import send_whatsapp_alert as send_telegram_alert
 
 # ── Mixin modules ─────────────────────────────────────────────────────────────
 from modules.speech import SpeechMixin
@@ -172,7 +172,7 @@ class _SurveillanceClient:
                             severity=self._severity(etype),
                         )
             except Exception:
-                pass
+                logging.debug("[Surveillance] Poll error", exc_info=True)
             time.sleep(self.POLL_INTERVAL)
 
 
@@ -435,27 +435,43 @@ class BuddyIntegratedPi(
         if self._surveillance_client:
             self._surveillance_client.stop()
         if self.eyes:
-            try: self.eyes.stop()
-            except Exception: pass
-        try: self.motors.cleanup()
-        except Exception: pass
+            try:
+                self.eyes.stop()
+            except Exception as exc:
+                self.logger.debug("Eyes stop failed: %s", exc)
+        try:
+            self.motors.cleanup()
+        except Exception as exc:
+            self.logger.debug("Motors cleanup failed: %s", exc)
         if self._ultrasonic_sensor:
-            try: self._ultrasonic_sensor.close()
-            except Exception: pass
-            finally: self._ultrasonic_sensor = None
+            try:
+                self._ultrasonic_sensor.close()
+            except Exception as exc:
+                self.logger.debug("Ultrasonic close failed: %s", exc)
+            finally:
+                self._ultrasonic_sensor = None
         if self.servo_enabled and self.servo:
-            try: self.servo.cleanup()
-            except Exception: pass
-            finally: self.servo_enabled = False
+            try:
+                self.servo.cleanup()
+            except Exception as exc:
+                self.logger.debug("Servo cleanup failed: %s", exc)
+            finally:
+                self.servo_enabled = False
         self._pc_stream_active = False
         if self.cap is not None:
-            try: self.cap.release()
-            except Exception: pass
+            try:
+                self.cap.release()
+            except Exception as exc:
+                self.logger.debug("Camera release failed: %s", exc)
         if self.csi_process:
-            try: self.csi_process.terminate()
-            except Exception: pass
-        try: cv2.destroyAllWindows()
-        except Exception: pass
+            try:
+                self.csi_process.terminate()
+            except Exception as exc:
+                self.logger.debug("CSI process terminate failed: %s", exc)
+        try:
+            cv2.destroyAllWindows()
+        except Exception as exc:
+            self.logger.debug("destroyAllWindows failed: %s", exc)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
