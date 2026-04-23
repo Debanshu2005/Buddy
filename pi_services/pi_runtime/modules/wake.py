@@ -1,6 +1,6 @@
 """Wake word mixin — Vosk wake word detection and sleep monitoring."""
 from __future__ import annotations
-import json, re, subprocess, threading
+import json, os, re, subprocess, threading
 from typing import Optional
 
 try:
@@ -11,6 +11,8 @@ except Exception:
 
 def _get_vosk_globals():
     """Fetch vosk state from buddy module at call time (loaded once there)."""
+    if os.getenv("BUDDY_DISABLE_VOSK_WAKE", "0") == "1":
+        return False, None
     try:
         import pi_runtime.buddy as _buddy
         return _buddy._vosk_available, _buddy._vosk_model

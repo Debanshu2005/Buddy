@@ -7,6 +7,8 @@ from hardware.oled_eyes import EyeState
 
 def _get_vosk_available() -> bool:
     """Read vosk availability from buddy module at call time (loaded once there)."""
+    if os.getenv("BUDDY_DISABLE_VOSK_WAKE", "0") == "1":
+        return False
     try:
         import pi_runtime.buddy as _buddy
         return bool(_buddy._vosk_available)
@@ -385,6 +387,7 @@ class ConversationMixin:
             if _get_vosk_available():
                 detected = self._vosk_listen_for_wake_word()
                 if not detected:
+                    time.sleep(0.2)
                     continue
                 inline_command = self._extract_inline_command_from_wake(self._last_wake_text)
             else:

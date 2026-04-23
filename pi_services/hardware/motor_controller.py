@@ -58,10 +58,10 @@ class MotorController:
         "pondering":    "T",
         "thoughtful":   "T",
         # Curious → pan left-right (short, self-stopping)
-        "curious":      "PAN",
-        "interested":   "PAN",
-        "inquisitive":  "PAN",
-        "attentive":    "PAN",
+        "curious":      "pan",
+        "interested":   "pan",
+        "inquisitive":  "pan",
+        "attentive":    "pan",
         # Sad / negative → slow backward until stopped
         "sad":          "B",
         "unhappy":      "B",

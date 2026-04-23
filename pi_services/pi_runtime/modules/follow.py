@@ -154,7 +154,7 @@ class FollowMixin:
 
 
     def _on_obstacle(self):
-        if not self.is_speaking:
+        if not self.is_speaking and not self._ultrasonic_blocked:
             self.speak("Obstacle detected. I have stopped.")
 
 
