@@ -4,6 +4,15 @@ import json, os, threading, time
 from typing import Optional
 from hardware.oled_eyes import EyeState
 
+
+def _get_vosk_available() -> bool:
+    """Read vosk availability from buddy module at call time (loaded once there)."""
+    try:
+        import pi_runtime.buddy as _buddy
+        return bool(_buddy._vosk_available)
+    except Exception:
+        return False
+
 class ConversationMixin:
     def _response_user_key(self) -> str:
         return (self.active_user or "unknown").strip().lower() or "unknown"
@@ -248,7 +257,7 @@ class ConversationMixin:
                 try:
                     self._text_register_face()
                 finally:
-                    self._text_mode_active = True  # keep active — still in text session
+                    pass  # stay in text session
                 continue
 
             if self._is_identity_check(lowered):
@@ -373,7 +382,7 @@ class ConversationMixin:
             if self._pause_wake_listening:
                 time.sleep(0.1)
                 continue
-            if _vosk_available:
+            if _get_vosk_available():
                 detected = self._vosk_listen_for_wake_word()
                 if not detected:
                     continue
@@ -404,7 +413,7 @@ class ConversationMixin:
 
         while self.running and self.sleep_mode:
             try:
-                if _vosk_available:
+                if _get_vosk_available():
                     # Single continuous stream — handles emergencies inline, returns on wake word
                     if self._vosk_monitor_sleep():
                         inline_command = self._extract_inline_command_from_wake(self._last_wake_text)

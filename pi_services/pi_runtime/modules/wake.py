@@ -3,6 +3,20 @@ from __future__ import annotations
 import json, re, subprocess, threading
 from typing import Optional
 
+try:
+    from vosk import KaldiRecognizer as _KaldiRecognizer
+except Exception:
+    _KaldiRecognizer = None
+
+
+def _get_vosk_globals():
+    """Fetch vosk state from buddy module at call time (loaded once there)."""
+    try:
+        import pi_runtime.buddy as _buddy
+        return _buddy._vosk_available, _buddy._vosk_model
+    except Exception:
+        return False, None
+
 class WakeMixin:
     def _is_ok_response(self, text: str) -> bool:
         lowered = text.lower().strip()
@@ -65,6 +79,7 @@ class WakeMixin:
 
 
     def _vosk_listen_for_wake_word(self) -> bool:
+        _vosk_available, _vosk_model = _get_vosk_globals()
         if not _vosk_available:
             return False
         rec = _KaldiRecognizer(_vosk_model, 16000)
@@ -122,6 +137,7 @@ class WakeMixin:
         - Triggers emergency response immediately for any emergency phrase.
         - Returns True when wake word detected, False if stream ends.
         """
+        _vosk_available, _vosk_model = _get_vosk_globals()
         if not _vosk_available:
             return False
 

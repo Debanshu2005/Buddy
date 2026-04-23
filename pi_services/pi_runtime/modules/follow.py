@@ -1,10 +1,15 @@
 """Follow mixin — follow mode, clap detection, ultrasonic, obstacle handling."""
 from __future__ import annotations
-import os, threading, time
+import os, subprocess, threading, time
 from typing import Optional
 import cv2
 import numpy as np
 from hardware.oled_eyes import EyeState
+
+try:
+    from gpiozero import DistanceSensor
+except Exception:
+    DistanceSensor = None
 
 class FollowMixin:
     def _init_ultrasonic_sensor(self):
@@ -36,10 +41,10 @@ class FollowMixin:
 
 
     def _ultrasonic_loop(self):
-        while self.running is False and not self._cleaned_up:
+        while not self.running and not self._cleaned_up:
             time.sleep(0.05)
         log_timer = 0.0
-        while not self._cleaned_up:
+        while self.running and not self._cleaned_up:
             sensor = self._ultrasonic_sensor
             if sensor is None:
                 return

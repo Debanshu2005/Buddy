@@ -1,7 +1,12 @@
 """Camera mixin — init, frame loop, vision tasks, stream server."""
 from __future__ import annotations
 import os, shutil, subprocess, sys, threading, time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from socketserver import ThreadingMixIn
 from typing import Optional
+
+_MODULE_ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 import cv2
 import numpy as np
 from hardware.oled_eyes import EyeState
@@ -61,7 +66,7 @@ class CameraMixin:
                 return
             self.logger.warning("PC stream unavailable, falling back to local camera")
 
-        helper_path = ROOT_DIR / "hardware" / "csi_camera_helper.py"
+        helper_path = _MODULE_ROOT_DIR / "hardware" / "csi_camera_helper.py"
         if shutil.which("rpicam-hello") and helper_path.exists():
             try:
                 self.csi_process = subprocess.Popen(

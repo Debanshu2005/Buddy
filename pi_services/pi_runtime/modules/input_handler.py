@@ -1,6 +1,6 @@
 """Input handler mixin — command processing, movement, brain calls, face registration."""
 from __future__ import annotations
-import os, re, threading, time
+import os, random, re, threading, time
 from typing import Optional
 import numpy as np
 import requests
@@ -427,8 +427,6 @@ class InputHandlerMixin:
             cmd = _brain_move[intent]
             if self._movement_allowed(cmd):
                 self.motors.move(cmd, None if cmd == "S" else 1.5)
-        elif intent == "stop":
-            self.motors.stop()
         if emotion:
             self._apply_emotion(emotion)
         self.speak(reply)

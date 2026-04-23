@@ -1,6 +1,8 @@
 """Notifications mixin — phone listener, notification queue."""
 from __future__ import annotations
 import json, threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from phone_link.core import process_notification
 
 class NotificationsMixin:
